@@ -1,0 +1,278 @@
+name: Remove Watermark + RIFE 20221029 (Sharded)
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: '水印区域 x,y,w,h'
+        required: true
+        default: '1800,2052,2000,80'
+      width:
+        default: '3840'
+      height:
+        default: '2160'
+      fps:
+        description: '原始帧率'
+        default: '30'
+      ctx_frames:
+        description: '上下文帧数（前后各多取）'
+        default: '5'
+
+jobs:
+  # ============================================
+  # Stage 1: 去水印 (4 分片并行，带上下文)
+  # ============================================
+  remove_wm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 0
+            head_ctx: 0
+            tail_ctx: 1
+          - shard: 1
+            head_ctx: 1
+            tail_ctx: 1
+          - shard: 2
+            head_ctx: 1
+            tail_ctx: 1
+          - shard: 3
+            head_ctx: 1
+            tail_ctx: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download input video from Release
+        run: |
+          wget -q -O input.mp4 \
+            https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4
+          ls -lh input.mp4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/iopaint
+          key: iopaint-lama-v1
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg bc
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install iopaint opencv-python-headless pillow numpy
+
+      - name: Compute shard times
+        id: t
+        run: |
+          FPS=${{ github.event.inputs.fps }}
+          CTX_FRAMES=${{ github.event.inputs.ctx_frames }}
+          CTX_SEC=$(echo "scale=6; $CTX_FRAMES / $FPS" | bc)
+          SHARD=${{ matrix.shard }}
+          HEAD=${{ matrix.head_ctx }}
+          TAIL=${{ matrix.tail_ctx }}
+
+          SS=$(echo "scale=6; $SHARD * 5 - $HEAD * $CTX_SEC" | bc)
+          DUR=$(echo "scale=6; 5 + ($HEAD + $TAIL) * $CTX_SEC" | bc)
+
+          if (( $(echo "$SS < 0" | bc -l) )); then
+            SS=0
+          fi
+
+          echo "ss=$SS" >> $GITHUB_OUTPUT
+          echo "dur=$DUR" >> $GITHUB_OUTPUT
+          echo "Shard $SHARD: SS=$SS DUR=$DUR CTX_SEC=$CTX_SEC"
+
+      - name: Remove watermark (shard ${{ matrix.shard }})
+        env:
+          REGION: ${{ github.event.inputs.region }}
+          W: ${{ github.event.inputs.width }}
+          H: ${{ github.event.inputs.height }}
+          FPS: ${{ github.event.inputs.fps }}
+        run: |
+          set -o pipefail
+          SS=${{ steps.t.outputs.ss }}
+          DUR=${{ steps.t.outputs.dur }}
+          echo "Processing shard ${{ matrix.shard }}: SS=$SS DUR=$DUR"
+
+          ffmpeg -i input.mp4 -ss $SS -t $DUR -f rawvideo -pix_fmt bgr24 - \
+            | python scripts/process.py \
+            | ffmpeg -y \
+                -f rawvideo -pix_fmt bgr24 -s ${W}x${H} -r ${FPS} -i - \
+                -c:v libaom-av1 -crf 0 -cpu-used 8 -row-mt 1 -threads 2 \
+                -an wm_shard_${{ matrix.shard }}.mkv
+
+          ls -lh wm_shard_${{ matrix.shard }}.mkv
+
+      - name: Upload wm shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: wm-shard-${{ matrix.shard }}
+          path: wm_shard_${{ matrix.shard }}.mkv
+          retention-days: 7
+
+  # ============================================
+  # Stage 2: RIFE 20221029 补帧 (4 分片并行)
+  # ============================================
+  interpolate:
+    needs: remove_wm
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 0
+            head_ctx: 0
+            tail_ctx: 1
+          - shard: 1
+            head_ctx: 1
+            tail_ctx: 1
+          - shard: 2
+            head_ctx: 1
+            tail_ctx: 1
+          - shard: 3
+            head_ctx: 1
+            tail_ctx: 0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (Vulkan + FFmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg wget unzip \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools
+
+      - name: Verify Vulkan availability
+        run: |
+          vulkaninfo --summary 2>&1 | head -40 || echo "Vulkan info failed (will fallback to CPU)"
+
+      - name: Install rife-ncnn-vulkan 20221029
+        run: |
+          wget -q https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-ubuntu.zip
+          unzip -q rife-ncnn-vulkan-20221029-ubuntu.zip
+          chmod +x rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan
+          echo "=== Package contents ==="
+          ls -R rife-ncnn-vulkan-20221029-ubuntu | head -60
+
+      - name: Download wm shard
+        uses: actions/download-artifact@v4
+        with:
+          name: wm-shard-${{ matrix.shard }}
+
+      - name: Extract frames from wm shard
+        run: |
+          mkdir -p frames_in
+          ffmpeg -i wm_shard_${{ matrix.shard }}.mkv -q:v 2 frames_in/%06d.jpg
+          echo "Extracted frames: $(ls frames_in | wc -l)"
+
+      - name: RIFE interpolation 2x
+        run: |
+          MODEL_DIR="rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
+          if [ ! -d "$MODEL_DIR" ]; then
+            echo "rife-v4.6 not found, searching..."
+            MODEL_DIR=$(find rife-ncnn-vulkan-20221029-ubuntu -maxdepth 1 -type d -name "rife-v*" | head -1)
+          fi
+          echo "Using model dir: $MODEL_DIR"
+
+          ./rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan \
+            -i frames_in \
+            -o frames_out \
+            -m "$MODEL_DIR" \
+            -j 2:2:2 \
+            -f "%06d.jpg"
+
+          echo "RIFE output frames: $(ls frames_out | wc -l)"
+
+      - name: Trim context and rebuild 60fps AV1 lossless
+        env:
+          CTX_FRAMES: ${{ github.event.inputs.ctx_frames }}
+        run: |
+          CTX=${{ github.event.inputs.ctx_frames }}
+          HEAD_CTX=${{ matrix.head_ctx }}
+          TAIL_CTX=${{ matrix.tail_ctx }}
+
+          TOTAL_INTERP=$(ls frames_out/*.jpg | wc -l)
+          HEAD_TRIM=$(( HEAD_CTX * 2 * CTX ))
+          TAIL_TRIM=$(( TAIL_CTX * 2 * CTX ))
+          START=$HEAD_TRIM
+          END=$(( TOTAL_INTERP - TAIL_TRIM - 1 ))
+
+          echo "TOTAL_INTERP=$TOTAL_INTERP HEAD_TRIM=$HEAD_TRIM TAIL_TRIM=$TAIL_TRIM"
+          echo "Keep frames [$START, $END] => $(( END - START + 1 )) frames"
+
+          ffmpeg -y -framerate 60 -i frames_out/%06d.jpg \
+            -vf "select='between(n,$START,$END)',setpts=N/FRAME_RATE/TB" \
+            -c:v libaom-av1 -crf 0 -cpu-used 8 -row-mt 1 -threads 2 \
+            -an interp_shard_${{ matrix.shard }}.mkv
+
+          ls -lh interp_shard_${{ matrix.shard }}.mkv
+
+      - name: Upload interp shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: interp-shard-${{ matrix.shard }}
+          path: interp_shard_${{ matrix.shard }}.mkv
+          retention-days: 7
+
+  # ============================================
+  # Stage 3: 合并 + 音轨还原
+  # ============================================
+  merge:
+    needs: interpolate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download input video from Release
+        run: |
+          wget -q -O input.mp4 \
+            https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4
+          ls -lh input.mp4
+
+      - name: Download all interp shards
+        uses: actions/download-artifact@v4
+        with:
+          path: shards
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: List shards
+        run: find shards -type f -exec ls -lh {} \;
+
+      - name: Concat + restore audio (final MKV)
+        run: |
+          > list.txt
+          for i in 0 1 2 3; do
+            echo "file 'shards/interp-shard-$i/interp_shard_$i.mkv'" >> list.txt
+          done
+          cat list.txt
+
+          ffmpeg -y -f concat -safe 0 -i list.txt -c copy merged_60fps.mkv
+
+          ffmpeg -y -i merged_60fps.mkv -i input.mp4 \
+            -map 0:v -map 1:a? \
+            -c:v copy -c:a copy \
+            -map_metadata -1 \
+            output_60fps.mkv
+
+          ls -lh output_60fps.mkv
+          echo "=== Final video info ==="
+          ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height,r_frame_rate,nb_frames,duration \
+            -of default=noprint_wrappers=1 output_60fps.mkv
+
+      - name: Upload final
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-video-60fps
+          path: output_60fps.mkv
+          retention-days: 7
