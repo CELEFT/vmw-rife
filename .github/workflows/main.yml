@@ -8,15 +8,21 @@ on:
         required: true
         default: '1800,2052,2000,80'
       width:
+        description: '视频宽度'
+        required: true
         default: '3840'
       height:
+        description: '视频高度'
+        required: true
         default: '2160'
       fps:
         description: '原始帧率'
+        required: true
         default: '30'
       ctx_frames:
         description: '上下文帧数（前后各多取）'
-        default: '5'
+        required: true
+        default: '10'
 
 jobs:
   # ============================================
@@ -117,7 +123,7 @@ jobs:
           retention-days: 7
 
   # ============================================
-  # Stage 2: RIFE 20221029 补帧 (4 分片并行)
+  # Stage 2: RIFE 20221029 补帧 (4 分片并行，PNG 无损)
   # ============================================
   interpolate:
     needs: remove_wm
@@ -166,13 +172,14 @@ jobs:
         with:
           name: wm-shard-${{ matrix.shard }}
 
-      - name: Extract frames from wm shard
+      - name: Extract frames as PNG (lossless)
         run: |
           mkdir -p frames_in
-          ffmpeg -i wm_shard_${{ matrix.shard }}.mkv -q:v 2 frames_in/%06d.jpg
+          ffmpeg -i wm_shard_${{ matrix.shard }}.mkv frames_in/%06d.png
           echo "Extracted frames: $(ls frames_in | wc -l)"
+          du -sh frames_in
 
-      - name: RIFE interpolation 2x
+      - name: RIFE interpolation 2x (PNG)
         run: |
           MODEL_DIR="rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
           if [ ! -d "$MODEL_DIR" ]; then
@@ -186,9 +193,10 @@ jobs:
             -o frames_out \
             -m "$MODEL_DIR" \
             -j 2:2:2 \
-            -f "%06d.jpg"
+            -f "%06d.png"
 
           echo "RIFE output frames: $(ls frames_out | wc -l)"
+          du -sh frames_out
 
       - name: Trim context and rebuild 60fps AV1 lossless
         env:
@@ -198,7 +206,7 @@ jobs:
           HEAD_CTX=${{ matrix.head_ctx }}
           TAIL_CTX=${{ matrix.tail_ctx }}
 
-          TOTAL_INTERP=$(ls frames_out/*.jpg | wc -l)
+          TOTAL_INTERP=$(ls frames_out/*.png | wc -l)
           HEAD_TRIM=$(( HEAD_CTX * 2 * CTX ))
           TAIL_TRIM=$(( TAIL_CTX * 2 * CTX ))
           START=$HEAD_TRIM
@@ -207,7 +215,7 @@ jobs:
           echo "TOTAL_INTERP=$TOTAL_INTERP HEAD_TRIM=$HEAD_TRIM TAIL_TRIM=$TAIL_TRIM"
           echo "Keep frames [$START, $END] => $(( END - START + 1 )) frames"
 
-          ffmpeg -y -framerate 60 -i frames_out/%06d.jpg \
+          ffmpeg -y -framerate 60 -i frames_out/%06d.png \
             -vf "select='between(n,$START,$END)',setpts=N/FRAME_RATE/TB" \
             -c:v libaom-av1 -crf 0 -cpu-used 8 -row-mt 1 -threads 2 \
             -an interp_shard_${{ matrix.shard }}.mkv
