@@ -29,9 +29,9 @@ on:
         required: true
         default: 'auto'
       preset:
-        description: '编码速度 preset（ultrafast / medium / slow）'
+        description: '编码速度 preset（AV1: 4-12 越小越慢越好；x265/x264: ultrafast/medium/slow）'
         required: true
-        default: 'medium'
+        default: '8'
 
 jobs:
   transcode:
@@ -41,10 +41,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
+      # ============ 安装工具 + 最新 ffmpeg ============
+      - name: Install tools & latest FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg wget unzip p7zip-full file
+          sudo apt-get install -y wget unzip p7zip-full file
+
+          echo ">>> Downloading latest BtbN FFmpeg build..."
+          mkdir -p $HOME/ffmpeg-new
+          wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf ffmpeg-master-latest-linux64-gpl.tar.xz -C $HOME/ffmpeg-new --strip-components=1
+
+          # 把新 ffmpeg 放到 PATH 最前
+          echo "$HOME/ffmpeg-new/bin" >> $GITHUB_PATH
+
+          # 验证
+          $HOME/ffmpeg-new/bin/ffmpeg -version | head -3
+          echo "---可用编码器---"
+          $HOME/ffmpeg-new/bin/ffmpeg -encoders 2>/dev/null | grep -E "libsvtav1|libaom-av1|libx265|libx264"
 
       # ============ 1. 下载 ============
       - name: Download input
@@ -56,7 +70,6 @@ jobs:
       - name: Detect type and extract
         run: |
           mkdir -p extracted
-
           FILE_TYPE=$(file -b --mime-type input_file)
           echo "Detected MIME type: $FILE_TYPE"
 
@@ -140,10 +153,11 @@ jobs:
         run: |
           CODEC=${{ github.event.inputs.codec }}
           PIXFMT=${{ github.event.inputs.pix_fmt }}
+          PRESET=${{ github.event.inputs.preset }}
 
           if [ "$CODEC" = "av1" ]; then
             echo "encoder=libsvtav1" >> $GITHUB_OUTPUT
-            echo "extra_opts=-preset 6" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset $PRESET" >> $GITHUB_OUTPUT
             if [ "$PIXFMT" = "auto" ]; then
               echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
             else
@@ -151,7 +165,7 @@ jobs:
             fi
           elif [ "$CODEC" = "hevc" ]; then
             echo "encoder=libx265" >> $GITHUB_OUTPUT
-            echo "extra_opts=-preset ${{ github.event.inputs.preset }} -x265-params pools=2" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset $PRESET -x265-params pools=2" >> $GITHUB_OUTPUT
             if [ "$PIXFMT" = "auto" ]; then
               echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
             else
@@ -159,7 +173,7 @@ jobs:
             fi
           elif [ "$CODEC" = "h264" ]; then
             echo "encoder=libx264" >> $GITHUB_OUTPUT
-            echo "extra_opts=-preset ${{ github.event.inputs.preset }}" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset $PRESET" >> $GITHUB_OUTPUT
             if [ "$PIXFMT" = "auto" ]; then
               echo "pix_fmt=yuv420p" >> $GITHUB_OUTPUT
             else
@@ -180,7 +194,7 @@ jobs:
             echo "scale_filter=-vf scale=$RES" >> $GITHUB_OUTPUT
           fi
 
-      # ============ 6. 转码所有视频（关键修复：用 env 传参）============
+      # ============ 6. 转码 ============
       - name: Transcode all videos
         env:
           ENCODER: ${{ steps.enc.outputs.encoder }}
@@ -192,6 +206,9 @@ jobs:
         run: |
           mkdir -p outputs
 
+          echo ">>> ffmpeg version:"
+          ffmpeg -version | head -3
+          echo ""
           echo "Encoder:   $ENCODER"
           echo "ExtraOpts: $EXTRA_OPTS"
           echo "PixFmt:    $PIX_FMT"
@@ -212,8 +229,6 @@ jobs:
             echo "===== [$INDEX] Transcoding: $VIDEO ====="
             echo ">>> Output: $OUTPUT"
 
-            # 注意：$EXTRA_OPTS 不加引号，让 shell 正确 word-split
-            #       $SCALE_FILTER 同理
             ffmpeg -y -i "$VIDEO" \
               $SCALE_FILTER \
               -c:v $ENCODER -b:v $BITRATE $EXTRA_OPTS \
