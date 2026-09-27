@@ -54,17 +54,18 @@ jobs:
         with:
           python-version: '3.10'
 
-      - uses: actions/cache@v4
+      - name: Cache LaMa model
+        uses: actions/cache@v4
         with:
-          path: ~/.cache/iopaint
-          key: iopaint-lama-v1
+          path: ~/.cache/torch
+          key: simple-lama-model-v1
 
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg bc
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install iopaint opencv-python-headless pillow numpy
+          pip install simple-lama-inpainting opencv-python-headless pillow numpy
 
       - name: Compute shard times
         id: t
