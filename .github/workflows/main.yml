@@ -26,7 +26,7 @@ on:
 
 jobs:
   # ============================================
-  # Stage 1: 去水印 (4 分片并行，带上下文)
+  # Stage 1: 去水印 (4 分片并行，按帧号精确提取)
   # ============================================
   remove_wm:
     runs-on: ubuntu-latest
@@ -69,30 +69,39 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg bc
+          sudo apt-get install -y ffmpeg
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install simple-lama-inpainting opencv-python-headless pillow numpy
 
-      - name: Compute shard times
+      - name: Compute shard frame range
         id: t
         run: |
-          FPS=${{ github.event.inputs.fps }}
-          CTX_FRAMES=${{ github.event.inputs.ctx_frames }}
-          CTX_SEC=$(echo "scale=6; $CTX_FRAMES / $FPS" | bc)
+          CTX=${{ github.event.inputs.ctx_frames }}
           SHARD=${{ matrix.shard }}
           HEAD=${{ matrix.head_ctx }}
           TAIL=${{ matrix.tail_ctx }}
 
-          SS=$(echo "scale=6; $SHARD * 5 - $HEAD * $CTX_SEC" | bc)
-          DUR=$(echo "scale=6; 5 + ($HEAD + $TAIL) * $CTX_SEC" | bc)
+          TOTAL_FRAMES=$(ffprobe -v error -select_streams v:0 -count_frames \
+            -show_entries stream=nb_read_frames -of csv=p=0 input.mp4)
+          echo "Total frames probed: $TOTAL_FRAMES"
 
-          if (( $(echo "$SS < 0" | bc -l) )); then
-            SS=0
+          FRAMES_PER_SHARD=$(( (TOTAL_FRAMES + 3) / 4 ))
+
+          CORE_START=$(( SHARD * FRAMES_PER_SHARD ))
+          CORE_END=$(( CORE_START + FRAMES_PER_SHARD - 1 ))
+          if [ $CORE_END -ge $TOTAL_FRAMES ]; then
+            CORE_END=$(( TOTAL_FRAMES - 1 ))
           fi
 
-          echo "ss=$SS" >> $GITHUB_OUTPUT
-          echo "dur=$DUR" >> $GITHUB_OUTPUT
-          echo "Shard $SHARD: SS=$SS DUR=$DUR CTX_SEC=$CTX_SEC"
+          SEL_START=$(( CORE_START - HEAD * CTX ))
+          SEL_END=$(( CORE_END + TAIL * CTX ))
+          if [ $SEL_START -lt 0 ]; then SEL_START=0; fi
+
+          echo "core_start=$CORE_START" >> $GITHUB_OUTPUT
+          echo "core_end=$CORE_END" >> $GITHUB_OUTPUT
+          echo "sel_start=$SEL_START" >> $GITHUB_OUTPUT
+          echo "sel_end=$SEL_END" >> $GITHUB_OUTPUT
+          echo "Shard $SHARD: core=[$CORE_START,$CORE_END] sel=[$SEL_START,$SEL_END]"
 
       - name: Remove watermark (shard ${{ matrix.shard }})
         env:
@@ -102,15 +111,19 @@ jobs:
           FPS: ${{ github.event.inputs.fps }}
         run: |
           set -o pipefail
-          SS=${{ steps.t.outputs.ss }}
-          DUR=${{ steps.t.outputs.dur }}
-          echo "Processing shard ${{ matrix.shard }}: SS=$SS DUR=$DUR"
+          SEL_START=${{ steps.t.outputs.sel_start }}
+          SEL_END=${{ steps.t.outputs.sel_end }}
+          echo "Processing shard ${{ matrix.shard }}: frames [$SEL_START, $SEL_END]"
 
-          ffmpeg -i input.mp4 -ss $SS -t $DUR -f rawvideo -pix_fmt bgr24 - \
+          ffmpeg -i input.mp4 \
+            -vf "select='between(n,$SEL_START,$SEL_END)'" \
+            -fps_mode passthrough \
+            -f rawvideo -pix_fmt bgr24 - \
             | python scripts/process.py \
             | ffmpeg -y \
                 -f rawvideo -pix_fmt bgr24 -s ${W}x${H} -r ${FPS} -i - \
                 -c:v libaom-av1 -crf 0 -cpu-used 8 -row-mt 1 -threads 2 \
+                -pix_fmt yuv444p10le \
                 -an wm_shard_${{ matrix.shard }}.mkv
 
           ls -lh wm_shard_${{ matrix.shard }}.mkv
@@ -146,8 +159,7 @@ jobs:
             head_ctx: 1
             tail_ctx: 0
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install system deps (Vulkan + FFmpeg)
         run: |
@@ -157,15 +169,25 @@ jobs:
 
       - name: Verify Vulkan availability
         run: |
-          vulkaninfo --summary 2>&1 | head -40 || echo "Vulkan info failed (will fallback to CPU)"
+          vulkaninfo --summary 2>&1 | head -40 || echo "Vulkan info failed (fallback to CPU)"
 
       - name: Install rife-ncnn-vulkan 20221029
         run: |
           wget -q https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-ubuntu.zip
           unzip -q rife-ncnn-vulkan-20221029-ubuntu.zip
           chmod +x rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan
-          echo "=== Package contents ==="
           ls -R rife-ncnn-vulkan-20221029-ubuntu | head -60
+
+      - name: Verify RIFE model exists
+        run: |
+          MODEL_DIR="rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
+          if [ ! -d "$MODEL_DIR" ]; then
+            MODEL_DIR=$(find rife-ncnn-vulkan-20221029-ubuntu -maxdepth 1 -type d -name "rife-v*" | head -1)
+          fi
+          if [ -z "$MODEL_DIR" ] || [ ! -d "$MODEL_DIR" ]; then
+            echo "ERROR: no RIFE model dir"; ls -R rife-ncnn-vulkan-20221029-ubuntu; exit 1
+          fi
+          echo "RIFE_MODEL_DIR=$MODEL_DIR" >> $GITHUB_ENV
 
       - name: Download wm shard
         uses: actions/download-artifact@v4
@@ -175,27 +197,17 @@ jobs:
       - name: Extract frames as PNG (lossless)
         run: |
           mkdir -p frames_in
-          ffmpeg -i wm_shard_${{ matrix.shard }}.mkv frames_in/%06d.png
-          echo "Extracted frames: $(ls frames_in | wc -l)"
+          ffmpeg -i wm_shard_${{ matrix.shard }}.mkv -pix_fmt rgb24 frames_in/%06d.png
+          echo "Extracted: $(ls frames_in | wc -l)"
           du -sh frames_in
 
       - name: RIFE interpolation 2x (PNG)
         run: |
-          MODEL_DIR="rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
-          if [ ! -d "$MODEL_DIR" ]; then
-            echo "rife-v4.6 not found, searching..."
-            MODEL_DIR=$(find rife-ncnn-vulkan-20221029-ubuntu -maxdepth 1 -type d -name "rife-v*" | head -1)
-          fi
-          echo "Using model dir: $MODEL_DIR"
-
+          mkdir -p frames_out
           ./rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan \
-            -i frames_in \
-            -o frames_out \
-            -m "$MODEL_DIR" \
-            -j 2:2:2 \
-            -f "%06d.png"
-
-          echo "RIFE output frames: $(ls frames_out | wc -l)"
+            -i frames_in -o frames_out \
+            -m "$RIFE_MODEL_DIR" -j 2:2:2 -f "%06d.png"
+          echo "RIFE out: $(ls frames_out | wc -l)"
           du -sh frames_out
 
       - name: Trim context and rebuild 60fps AV1 lossless
@@ -212,12 +224,13 @@ jobs:
           START=$HEAD_TRIM
           END=$(( TOTAL_INTERP - TAIL_TRIM - 1 ))
 
-          echo "TOTAL_INTERP=$TOTAL_INTERP HEAD_TRIM=$HEAD_TRIM TAIL_TRIM=$TAIL_TRIM"
-          echo "Keep frames [$START, $END] => $(( END - START + 1 )) frames"
+          echo "TOTAL=$TOTAL_INTERP HEAD_TRIM=$HEAD_TRIM TAIL_TRIM=$TAIL_TRIM"
+          echo "Keep [$START, $END] = $(( END - START + 1 )) frames"
 
           ffmpeg -y -framerate 60 -i frames_out/%06d.png \
             -vf "select='between(n,$START,$END)',setpts=N/FRAME_RATE/TB" \
             -c:v libaom-av1 -crf 0 -cpu-used 8 -row-mt 1 -threads 2 \
+            -pix_fmt yuv444p10le \
             -an interp_shard_${{ matrix.shard }}.mkv
 
           ls -lh interp_shard_${{ matrix.shard }}.mkv
@@ -242,7 +255,6 @@ jobs:
         run: |
           wget -q -O input.mp4 \
             https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4
-          ls -lh input.mp4
 
       - name: Download all interp shards
         uses: actions/download-artifact@v4
@@ -251,11 +263,7 @@ jobs:
 
       - name: Install ffmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
-      - name: List shards
-        run: find shards -type f -exec ls -lh {} \;
+          sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Concat + restore audio (final MKV)
         run: |
@@ -276,7 +284,7 @@ jobs:
           ls -lh output_60fps.mkv
           echo "=== Final video info ==="
           ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height,r_frame_rate,nb_frames,duration \
+            -show_entries stream=width,height,r_frame_rate,nb_frames,duration,pix_fmt \
             -of default=noprint_wrappers=1 output_60fps.mkv
 
       - name: Upload final
