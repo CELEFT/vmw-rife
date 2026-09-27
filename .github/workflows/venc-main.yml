@@ -16,9 +16,30 @@ on:
           - hevc
           - h264
         default: 'av1'
-      bitrate:
-        description: '目标码率（如 20M、8000k、5M）'
+      output_format:
+        description: '输出容器格式'
         required: true
+        type: choice
+        options:
+          - mkv
+          - mp4
+          - mov
+        default: 'mkv'
+      rate_control:
+        description: '码率控制模式'
+        required: true
+        type: choice
+        options:
+          - crf
+          - bitrate
+        default: 'crf'
+      crf:
+        description: '【CRF 模式】质量等级（AV1: 0-63，HEVC/H264: 0-51；越小越好，18-28 常用）'
+        required: false
+        default: '24'
+      bitrate:
+        description: '【bitrate 模式】目标码率（如 20M、8000k、5M）'
+        required: false
         default: '20M'
       resolution:
         description: '输出分辨率（保持原样填 original，或填 1920x1080）'
@@ -29,7 +50,7 @@ on:
         required: true
         default: 'auto'
       preset:
-        description: '编码速度 preset（AV1: 4-12 越小越慢越好；x265/x264: ultrafast/medium/slow）'
+        description: '编码 preset（AV1: 4-12；x265/x264: ultrafast/medium/slow）'
         required: true
         default: '8'
 
@@ -52,10 +73,8 @@ jobs:
           wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xJf ffmpeg-master-latest-linux64-gpl.tar.xz -C $HOME/ffmpeg-new --strip-components=1
 
-          # 把新 ffmpeg 放到 PATH 最前
           echo "$HOME/ffmpeg-new/bin" >> $GITHUB_PATH
 
-          # 验证
           $HOME/ffmpeg-new/bin/ffmpeg -version | head -3
           echo "---可用编码器---"
           $HOME/ffmpeg-new/bin/ffmpeg -encoders 2>/dev/null | grep -E "libsvtav1|libaom-av1|libx265|libx264"
@@ -147,14 +166,19 @@ jobs:
 
           printf '%s\n' "${VIDEOS[@]}" > video_list.txt
 
-      # ============ 4. 解析编码器 ============
-      - name: Resolve encoder settings
+      # ============ 4. 解析编码器 + 码率控制 + 容器 ============
+      - name: Resolve encoder & rate control & container
         id: enc
         run: |
           CODEC=${{ github.event.inputs.codec }}
           PIXFMT=${{ github.event.inputs.pix_fmt }}
           PRESET=${{ github.event.inputs.preset }}
+          RC=${{ github.event.inputs.rate_control }}
+          CRF=${{ github.event.inputs.crf }}
+          BITRATE=${{ github.event.inputs.bitrate }}
+          FORMAT=${{ github.event.inputs.output_format }}
 
+          # --- 编码器与额外参数 ---
           if [ "$CODEC" = "av1" ]; then
             echo "encoder=libsvtav1" >> $GITHUB_OUTPUT
             echo "extra_opts=-preset $PRESET" >> $GITHUB_OUTPUT
@@ -183,6 +207,49 @@ jobs:
             echo "Unsupported codec: $CODEC"; exit 1
           fi
 
+          # --- 码率控制 ---
+          if [ "$RC" = "crf" ]; then
+            echo "rc_opts=-crf $CRF" >> $GITHUB_OUTPUT
+            echo "rc_label=crf${CRF}" >> $GITHUB_OUTPUT
+            echo "Rate control: CRF=$CRF"
+          else
+            echo "rc_opts=-b:v $BITRATE" >> $GITHUB_OUTPUT
+            echo "rc_label=${BITRATE}" >> $GITHUB_OUTPUT
+            echo "Rate control: Bitrate=$BITRATE"
+          fi
+
+          # --- 容器相关参数 ---
+          if [ "$FORMAT" = "mkv" ]; then
+            echo "container_opts=" >> $GITHUB_OUTPUT
+            echo "audio_opts=-c:a copy" >> $GITHUB_OUTPUT
+            echo "ext=mkv" >> $GITHUB_OUTPUT
+            echo "Container: MKV (audio copy, no extra opts)"
+          elif [ "$FORMAT" = "mp4" ]; then
+            CONTAINER_OPTS="-movflags +faststart"
+            # HEVC 进 MP4 需要 hvc1 tag 才能被 Apple 设备识别
+            if [ "$CODEC" = "hevc" ]; then
+              CONTAINER_OPTS="$CONTAINER_OPTS -tag:v hvc1"
+            fi
+            echo "container_opts=$CONTAINER_OPTS" >> $GITHUB_OUTPUT
+            echo "audio_opts=-c:a aac -b:a 192k" >> $GITHUB_OUTPUT
+            echo "ext=mp4" >> $GITHUB_OUTPUT
+            echo "Container: MP4 (audio re-encode to AAC, faststart)"
+          elif [ "$FORMAT" = "mov" ]; then
+            CONTAINER_OPTS="-movflags +faststart"
+            if [ "$CODEC" = "hevc" ]; then
+              CONTAINER_OPTS="$CONTAINER_OPTS -tag:v hvc1"
+            fi
+            echo "container_opts=$CONTAINER_OPTS" >> $GITHUB_OUTPUT
+            echo "audio_opts=-c:a aac -b:a 192k" >> $GITHUB_OUTPUT
+            echo "ext=mov" >> $GITHUB_OUTPUT
+            echo "Container: MOV (audio re-encode to AAC, faststart)"
+            if [ "$CODEC" = "av1" ]; then
+              echo "::warning::AV1 in MOV is non-standard, Apple devices may not play it. Recommend MP4 or MKV."
+            fi
+          else
+            echo "Unsupported format: $FORMAT"; exit 1
+          fi
+
       # ============ 5. 构建缩放滤镜 ============
       - name: Build scale filter
         id: scale
@@ -199,9 +266,13 @@ jobs:
         env:
           ENCODER: ${{ steps.enc.outputs.encoder }}
           EXTRA_OPTS: ${{ steps.enc.outputs.extra_opts }}
+          RC_OPTS: ${{ steps.enc.outputs.rc_opts }}
+          RC_LABEL: ${{ steps.enc.outputs.rc_label }}
+          CONTAINER_OPTS: ${{ steps.enc.outputs.container_opts }}
+          AUDIO_OPTS: ${{ steps.enc.outputs.audio_opts }}
+          EXT: ${{ steps.enc.outputs.ext }}
           PIX_FMT: ${{ steps.enc.outputs.pix_fmt }}
           SCALE_FILTER: ${{ steps.scale.outputs.scale_filter }}
-          BITRATE: ${{ github.event.inputs.bitrate }}
           CODEC: ${{ github.event.inputs.codec }}
         run: |
           mkdir -p outputs
@@ -209,11 +280,15 @@ jobs:
           echo ">>> ffmpeg version:"
           ffmpeg -version | head -3
           echo ""
-          echo "Encoder:   $ENCODER"
-          echo "ExtraOpts: $EXTRA_OPTS"
-          echo "PixFmt:    $PIX_FMT"
-          echo "Scale:     $SCALE_FILTER"
-          echo "Bitrate:   $BITRATE"
+          echo "Encoder:       $ENCODER"
+          echo "ExtraOpts:     $EXTRA_OPTS"
+          echo "RC_Opts:       $RC_OPTS"
+          echo "RC_Label:      $RC_LABEL"
+          echo "ContainerOpts: $CONTAINER_OPTS"
+          echo "AudioOpts:     $AUDIO_OPTS"
+          echo "Extension:     .$EXT"
+          echo "PixFmt:        $PIX_FMT"
+          echo "Scale:         $SCALE_FILTER"
 
           INDEX=0
           while IFS= read -r VIDEO; do
@@ -223,7 +298,7 @@ jobs:
             BASENAME=$(basename "$VIDEO")
             NAME_NO_EXT="${BASENAME%.*}"
             SAFE_NAME=$(echo "$NAME_NO_EXT" | tr -c '[:alnum:]._-' '_')
-            OUTPUT="outputs/${SAFE_NAME}_${CODEC}_${BITRATE}.mkv"
+            OUTPUT="outputs/${SAFE_NAME}_${CODEC}_${RC_LABEL}.${EXT}"
 
             echo ""
             echo "===== [$INDEX] Transcoding: $VIDEO ====="
@@ -231,9 +306,10 @@ jobs:
 
             ffmpeg -y -i "$VIDEO" \
               $SCALE_FILTER \
-              -c:v $ENCODER -b:v $BITRATE $EXTRA_OPTS \
+              -c:v $ENCODER $RC_OPTS $EXTRA_OPTS \
               -pix_fmt $PIX_FMT \
-              -c:a copy \
+              $AUDIO_OPTS \
+              $CONTAINER_OPTS \
               -map_metadata -1 \
               "$OUTPUT"
 
@@ -255,10 +331,15 @@ jobs:
       # ============ 8. 输出信息 ============
       - name: Show output info
         run: |
-          for f in outputs/*.mkv; do
+          for f in outputs/*; do
+            [ -f "$f" ] || continue
             echo "=== $f ==="
             ffprobe -v error -select_streams v:0 \
               -show_entries stream=width,height,r_frame_rate,duration,codec_name,bit_rate,pix_fmt \
+              -of default=noprint_wrappers=1 "$f"
+            echo "--- audio ---"
+            ffprobe -v error -select_streams a:0 \
+              -show_entries stream=codec_name,bit_rate,channels,sample_rate \
               -of default=noprint_wrappers=1 "$f"
             echo ""
           done
