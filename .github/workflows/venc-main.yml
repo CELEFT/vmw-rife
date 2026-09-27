@@ -1,10 +1,10 @@
-name: Video Transcoder
+name: Video Transcoder (Auto Extract)
 
 on:
   workflow_dispatch:
     inputs:
-      video_url:
-        description: '输入视频 URL（直链）'
+      input_url:
+        description: '输入 URL（视频直链 或 压缩包直链）'
         required: true
         default: 'https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4'
       codec:
@@ -21,15 +21,15 @@ on:
         required: true
         default: '20M'
       resolution:
-        description: '输出分辨率（保持原样填 original，或填 1920x1080、3840x2160）'
+        description: '输出分辨率（保持原样填 original，或填 1920x1080）'
         required: true
         default: 'original'
       pix_fmt:
-        description: '像素格式（如 yuv420p、yuv444p10le，保持原样填 auto）'
+        description: '像素格式（auto / yuv420p / yuv420p10le / yuv444p10le）'
         required: true
         default: 'auto'
       preset:
-        description: '编码速度 preset（越慢质量越好，如 ultrafast、medium、slow）'
+        description: '编码速度 preset（ultrafast / medium / slow）'
         required: true
         default: 'medium'
 
@@ -41,22 +41,117 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg wget unzip p7zip-full file
 
-      - name: Download input video
+      # ============ 1. 下载 ============
+      - name: Download input
         run: |
-          wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
-          ls -lh input.mp4
+          wget -q -O input_file "${{ github.event.inputs.input_url }}"
+          ls -lh input_file
 
-      - name: Probe video info
+      # ============ 2. 自动检测 + 解压 ============
+      - name: Detect type and extract
+        id: extract
         run: |
-          ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height,r_frame_rate,duration,codec_name,pix_fmt \
-            -of default=noprint_wrappers=1 input.mp4
+          mkdir -p extracted
 
+          FILE_TYPE=$(file -b --mime-type input_file)
+          echo "Detected MIME type: $FILE_TYPE"
+
+          case "$FILE_TYPE" in
+            application/zip|application/x-zip-compressed)
+              echo ">>> ZIP detected, extracting with unzip"
+              unzip -q -o input_file -d extracted
+              ;;
+            application/x-7z-compressed)
+              echo ">>> 7z detected, extracting with 7z"
+              7z x -y -oextracted input_file > /dev/null
+              ;;
+            application/x-rar|application/vnd.rar)
+              echo ">>> RAR detected, extracting with 7z"
+              7z x -y -oextracted input_file > /dev/null
+              ;;
+            application/gzip)
+              echo ">>> GZIP/TAR.GZ detected"
+              tar -xzf input_file -C extracted 2>/dev/null || {
+                # 可能是单独的 .gz 文件
+                gunzip -c input_file > extracted/extracted_file
+              }
+              ;;
+            application/x-xz)
+              echo ">>> XZ/TAR.XZ detected"
+              tar -xJf input_file -C extracted 2>/dev/null || {
+                xz -dc input_file > extracted/extracted_file
+              }
+              ;;
+            application/x-bzip2)
+              echo ">>> BZIP2 detected"
+              tar -xjf input_file -C extracted 2>/dev/null || {
+                bzip2 -dc input_file > extracted/extracted_file
+              }
+              ;;
+            application/x-tar)
+              echo ">>> TAR detected"
+              tar -xf input_file -C extracted
+              ;;
+            video/*)
+              echo ">>> Direct video file, no extraction needed"
+              cp input_file extracted/
+              ;;
+            *)
+              echo ">>> Unknown MIME type: $FILE_TYPE"
+              echo ">>> Fallback: trying by extension and magic..."
+              # 兜底：尝试多种解压方式
+              if 7z t input_file > /dev/null 2>&1; then
+                echo "7z can handle it, extracting..."
+                7z x -y -oextracted input_file > /dev/null
+              elif tar -tf input_file > /dev/null 2>&1; then
+                echo "tar can handle it, extracting..."
+                tar -xf input_file -C extracted
+              elif unzip -t input_file > /dev/null 2>&1; then
+                echo "unzip can handle it, extracting..."
+                unzip -q -o input_file -d extracted
+              else
+                echo "ERROR: Cannot determine how to handle this file"
+                exit 1
+              fi
+              ;;
+          esac
+
+          echo ">>> Extraction done. Contents:"
+          find extracted -type f -exec ls -lh {} \;
+
+      # ============ 3. 查找所有视频文件 ============
+      - name: Find video files
+        id: find
+        run: |
+          mapfile -t VIDEOS < <(find extracted -type f \( \
+            -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.mov" \
+            -o -iname "*.avi" -o -iname "*.webm" -o -iname "*.flv" \
+            -o -iname "*.m4v" -o -iname "*.ts" -o -iname "*.m2ts" \
+            -o -iname "*.wmv" -o -iname "*.mpg" -o -iname "*.mpeg" \
+            -o -iname "*.rmvb" -o -iname "*.3gp" \
+            \) | sort)
+
+          COUNT=${#VIDEOS[@]}
+          echo "Found $COUNT video file(s):"
+          for v in "${VIDEOS[@]}"; do
+            echo "  - $v"
+          done
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: No video files found in extracted content"
+            exit 1
+          fi
+
+          # 保存视频列表（换行分隔）到文件，供后续步骤读取
+          printf '%s\n' "${VIDEOS[@]}" > video_list.txt
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      # ============ 4. 解析编码器 ============
       - name: Resolve encoder settings
         id: enc
         run: |
@@ -64,10 +159,8 @@ jobs:
           PIXFMT=${{ github.event.inputs.pix_fmt }}
 
           if [ "$CODEC" = "av1" ]; then
-            # 使用 SVT-AV1，比 libaom 快 10-50 倍，画质接近
             echo "encoder=libsvtav1" >> $GITHUB_OUTPUT
             echo "extra_opts=-preset 6" >> $GITHUB_OUTPUT
-            # 若未指定 pix_fmt，默认使用 yuv420p10le
             if [ "$PIXFMT" = "auto" ]; then
               echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
             else
@@ -90,10 +183,10 @@ jobs:
               echo "pix_fmt=$PIXFMT" >> $GITHUB_OUTPUT
             fi
           else
-            echo "Unsupported codec: $CODEC"
-            exit 1
+            echo "Unsupported codec: $CODEC"; exit 1
           fi
 
+      # ============ 5. 构建缩放滤镜 ============
       - name: Build scale filter
         id: scale
         run: |
@@ -106,38 +199,71 @@ jobs:
             echo "Scaling to $RES"
           fi
 
-      - name: Transcode
+      # ============ 6. 转码所有视频 ============
+      - name: Transcode all videos
         run: |
           ENCODER=${{ steps.enc.outputs.encoder }}
           EXTRA_OPTS=${{ steps.enc.outputs.extra_opts }}
           PIX_FMT=${{ steps.enc.outputs.pix_fmt }}
           SCALE_FILTER=${{ steps.scale.outputs.scale_filter }}
           BITRATE=${{ github.event.inputs.bitrate }}
-          OUTPUT="output_${{ github.event.inputs.codec }}_${BITRATE}.mkv"
+          CODEC=${{ github.event.inputs.codec }}
 
-          echo "Encoder: $ENCODER"
-          echo "Bitrate: $BITRATE"
-          echo "Pix_fmt: $PIX_FMT"
-          echo "Scale: $SCALE_FILTER"
-          echo "Output: $OUTPUT"
+          mkdir -p outputs
 
-          ffmpeg -y -i input.mp4 \
-            $SCALE_FILTER \
-            -c:v $ENCODER -b:v $BITRATE $EXTRA_OPTS \
-            -pix_fmt $PIX_FMT \
-            -c:a copy \
-            -map_metadata -1 \
-            "$OUTPUT"
+          INDEX=0
+          while IFS= read -r VIDEO; do
+            [ -z "$VIDEO" ] && continue
+            INDEX=$((INDEX + 1))
 
-          ls -lh "$OUTPUT"
-          echo "=== Output video info ==="
-          ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height,r_frame_rate,duration,codec_name,bit_rate,pix_fmt \
-            -of default=noprint_wrappers=1 "$OUTPUT"
+            BASENAME=$(basename "$VIDEO")
+            NAME_NO_EXT="${BASENAME%.*}"
+            # 清理文件名中的特殊字符
+            SAFE_NAME=$(echo "$NAME_NO_EXT" | tr -c '[:alnum:]._-' '_')
+            OUTPUT="outputs/${SAFE_NAME}_${CODEC}_${BITRATE}.mkv"
 
+            echo ""
+            echo "===== [$INDEX] Transcoding: $VIDEO ====="
+            echo ">>> Output: $OUTPUT"
+
+            ffmpeg -y -i "$VIDEO" \
+              $SCALE_FILTER \
+              -c:v $ENCODER -b:v $BITRATE $EXTRA_OPTS \
+              -pix_fmt $PIX_FMT \
+              -c:a copy \
+              -map_metadata -1 \
+              "$OUTPUT"
+
+            ls -lh "$OUTPUT"
+          done < video_list.txt
+
+          echo ""
+          echo "===== All transcoding done ====="
+          ls -lh outputs/
+
+      # ============ 7. 打包输出 ============
+      - name: Package outputs
+        run: |
+          cd outputs
+          zip -r -q ../transcoded_output.zip .
+          cd ..
+          ls -lh transcoded_output.zip
+
+      # ============ 8. 显示输出信息 ============
+      - name: Show output info
+        run: |
+          for f in outputs/*.mkv; do
+            echo "=== $f ==="
+            ffprobe -v error -select_streams v:0 \
+              -show_entries stream=width,height,r_frame_rate,duration,codec_name,bit_rate,pix_fmt \
+              -of default=noprint_wrappers=1 "$f"
+            echo ""
+          done
+
+      # ============ 9. 上传 ============
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
-          name: transcoded-video
-          path: output_*.mkv
+          name: transcoded-output
+          path: transcoded_output.zip
           retention-days: 7
