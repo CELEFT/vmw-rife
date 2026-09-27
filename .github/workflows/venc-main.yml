@@ -54,7 +54,6 @@ jobs:
 
       # ============ 2. 自动检测 + 解压 ============
       - name: Detect type and extract
-        id: extract
         run: |
           mkdir -p extracted
 
@@ -63,60 +62,47 @@ jobs:
 
           case "$FILE_TYPE" in
             application/zip|application/x-zip-compressed)
-              echo ">>> ZIP detected, extracting with unzip"
+              echo ">>> ZIP detected"
               unzip -q -o input_file -d extracted
               ;;
             application/x-7z-compressed)
-              echo ">>> 7z detected, extracting with 7z"
+              echo ">>> 7z detected"
               7z x -y -oextracted input_file > /dev/null
               ;;
             application/x-rar|application/vnd.rar)
-              echo ">>> RAR detected, extracting with 7z"
+              echo ">>> RAR detected"
               7z x -y -oextracted input_file > /dev/null
               ;;
             application/gzip)
               echo ">>> GZIP/TAR.GZ detected"
-              tar -xzf input_file -C extracted 2>/dev/null || {
-                # 可能是单独的 .gz 文件
-                gunzip -c input_file > extracted/extracted_file
-              }
+              tar -xzf input_file -C extracted 2>/dev/null || gunzip -c input_file > extracted/extracted_file
               ;;
             application/x-xz)
               echo ">>> XZ/TAR.XZ detected"
-              tar -xJf input_file -C extracted 2>/dev/null || {
-                xz -dc input_file > extracted/extracted_file
-              }
+              tar -xJf input_file -C extracted 2>/dev/null || xz -dc input_file > extracted/extracted_file
               ;;
             application/x-bzip2)
               echo ">>> BZIP2 detected"
-              tar -xjf input_file -C extracted 2>/dev/null || {
-                bzip2 -dc input_file > extracted/extracted_file
-              }
+              tar -xjf input_file -C extracted 2>/dev/null || bzip2 -dc input_file > extracted/extracted_file
               ;;
             application/x-tar)
               echo ">>> TAR detected"
               tar -xf input_file -C extracted
               ;;
             video/*)
-              echo ">>> Direct video file, no extraction needed"
+              echo ">>> Direct video file"
               cp input_file extracted/
               ;;
             *)
-              echo ">>> Unknown MIME type: $FILE_TYPE"
-              echo ">>> Fallback: trying by extension and magic..."
-              # 兜底：尝试多种解压方式
+              echo ">>> Unknown type: $FILE_TYPE, trying fallbacks..."
               if 7z t input_file > /dev/null 2>&1; then
-                echo "7z can handle it, extracting..."
                 7z x -y -oextracted input_file > /dev/null
               elif tar -tf input_file > /dev/null 2>&1; then
-                echo "tar can handle it, extracting..."
                 tar -xf input_file -C extracted
               elif unzip -t input_file > /dev/null 2>&1; then
-                echo "unzip can handle it, extracting..."
                 unzip -q -o input_file -d extracted
               else
-                echo "ERROR: Cannot determine how to handle this file"
-                exit 1
+                echo "ERROR: Cannot handle this file"; exit 1
               fi
               ;;
           esac
@@ -124,9 +110,8 @@ jobs:
           echo ">>> Extraction done. Contents:"
           find extracted -type f -exec ls -lh {} \;
 
-      # ============ 3. 查找所有视频文件 ============
+      # ============ 3. 查找视频 ============
       - name: Find video files
-        id: find
         run: |
           mapfile -t VIDEOS < <(find extracted -type f \( \
             -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.mov" \
@@ -143,13 +128,11 @@ jobs:
           done
 
           if [ "$COUNT" -eq 0 ]; then
-            echo "ERROR: No video files found in extracted content"
+            echo "ERROR: No video files found"
             exit 1
           fi
 
-          # 保存视频列表（换行分隔）到文件，供后续步骤读取
           printf '%s\n' "${VIDEOS[@]}" > video_list.txt
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
 
       # ============ 4. 解析编码器 ============
       - name: Resolve encoder settings
@@ -193,23 +176,27 @@ jobs:
           RES="${{ github.event.inputs.resolution }}"
           if [ "$RES" = "original" ]; then
             echo "scale_filter=" >> $GITHUB_OUTPUT
-            echo "Using original resolution"
           else
             echo "scale_filter=-vf scale=$RES" >> $GITHUB_OUTPUT
-            echo "Scaling to $RES"
           fi
 
-      # ============ 6. 转码所有视频 ============
+      # ============ 6. 转码所有视频（关键修复：用 env 传参）============
       - name: Transcode all videos
+        env:
+          ENCODER: ${{ steps.enc.outputs.encoder }}
+          EXTRA_OPTS: ${{ steps.enc.outputs.extra_opts }}
+          PIX_FMT: ${{ steps.enc.outputs.pix_fmt }}
+          SCALE_FILTER: ${{ steps.scale.outputs.scale_filter }}
+          BITRATE: ${{ github.event.inputs.bitrate }}
+          CODEC: ${{ github.event.inputs.codec }}
         run: |
-          ENCODER=${{ steps.enc.outputs.encoder }}
-          EXTRA_OPTS=${{ steps.enc.outputs.extra_opts }}
-          PIX_FMT=${{ steps.enc.outputs.pix_fmt }}
-          SCALE_FILTER=${{ steps.scale.outputs.scale_filter }}
-          BITRATE=${{ github.event.inputs.bitrate }}
-          CODEC=${{ github.event.inputs.codec }}
-
           mkdir -p outputs
+
+          echo "Encoder:   $ENCODER"
+          echo "ExtraOpts: $EXTRA_OPTS"
+          echo "PixFmt:    $PIX_FMT"
+          echo "Scale:     $SCALE_FILTER"
+          echo "Bitrate:   $BITRATE"
 
           INDEX=0
           while IFS= read -r VIDEO; do
@@ -218,7 +205,6 @@ jobs:
 
             BASENAME=$(basename "$VIDEO")
             NAME_NO_EXT="${BASENAME%.*}"
-            # 清理文件名中的特殊字符
             SAFE_NAME=$(echo "$NAME_NO_EXT" | tr -c '[:alnum:]._-' '_')
             OUTPUT="outputs/${SAFE_NAME}_${CODEC}_${BITRATE}.mkv"
 
@@ -226,6 +212,8 @@ jobs:
             echo "===== [$INDEX] Transcoding: $VIDEO ====="
             echo ">>> Output: $OUTPUT"
 
+            # 注意：$EXTRA_OPTS 不加引号，让 shell 正确 word-split
+            #       $SCALE_FILTER 同理
             ffmpeg -y -i "$VIDEO" \
               $SCALE_FILTER \
               -c:v $ENCODER -b:v $BITRATE $EXTRA_OPTS \
@@ -238,10 +226,10 @@ jobs:
           done < video_list.txt
 
           echo ""
-          echo "===== All transcoding done ====="
+          echo "===== All done ====="
           ls -lh outputs/
 
-      # ============ 7. 打包输出 ============
+      # ============ 7. 打包 ============
       - name: Package outputs
         run: |
           cd outputs
@@ -249,7 +237,7 @@ jobs:
           cd ..
           ls -lh transcoded_output.zip
 
-      # ============ 8. 显示输出信息 ============
+      # ============ 8. 输出信息 ============
       - name: Show output info
         run: |
           for f in outputs/*.mkv; do
