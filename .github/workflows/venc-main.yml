@@ -1,0 +1,143 @@
+name: Video Transcoder
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: '输入视频 URL（直链）'
+        required: true
+        default: 'https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4'
+      codec:
+        description: '输出视频编码器'
+        required: true
+        type: choice
+        options:
+          - av1
+          - hevc
+          - h264
+        default: 'av1'
+      bitrate:
+        description: '目标码率（如 20M、8000k、5M）'
+        required: true
+        default: '20M'
+      resolution:
+        description: '输出分辨率（保持原样填 original，或填 1920x1080、3840x2160）'
+        required: true
+        default: 'original'
+      pix_fmt:
+        description: '像素格式（如 yuv420p、yuv444p10le，保持原样填 auto）'
+        required: true
+        default: 'auto'
+      preset:
+        description: '编码速度 preset（越慢质量越好，如 ultrafast、medium、slow）'
+        required: true
+        default: 'medium'
+
+jobs:
+  transcode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Download input video
+        run: |
+          wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
+          ls -lh input.mp4
+
+      - name: Probe video info
+        run: |
+          ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height,r_frame_rate,duration,codec_name,pix_fmt \
+            -of default=noprint_wrappers=1 input.mp4
+
+      - name: Resolve encoder settings
+        id: enc
+        run: |
+          CODEC=${{ github.event.inputs.codec }}
+          PIXFMT=${{ github.event.inputs.pix_fmt }}
+
+          if [ "$CODEC" = "av1" ]; then
+            # 使用 SVT-AV1，比 libaom 快 10-50 倍，画质接近
+            echo "encoder=libsvtav1" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset 6" >> $GITHUB_OUTPUT
+            # 若未指定 pix_fmt，默认使用 yuv420p10le
+            if [ "$PIXFMT" = "auto" ]; then
+              echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
+            else
+              echo "pix_fmt=$PIXFMT" >> $GITHUB_OUTPUT
+            fi
+          elif [ "$CODEC" = "hevc" ]; then
+            echo "encoder=libx265" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset ${{ github.event.inputs.preset }} -x265-params pools=2" >> $GITHUB_OUTPUT
+            if [ "$PIXFMT" = "auto" ]; then
+              echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
+            else
+              echo "pix_fmt=$PIXFMT" >> $GITHUB_OUTPUT
+            fi
+          elif [ "$CODEC" = "h264" ]; then
+            echo "encoder=libx264" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset ${{ github.event.inputs.preset }}" >> $GITHUB_OUTPUT
+            if [ "$PIXFMT" = "auto" ]; then
+              echo "pix_fmt=yuv420p" >> $GITHUB_OUTPUT
+            else
+              echo "pix_fmt=$PIXFMT" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Unsupported codec: $CODEC"
+            exit 1
+          fi
+
+      - name: Build scale filter
+        id: scale
+        run: |
+          RES="${{ github.event.inputs.resolution }}"
+          if [ "$RES" = "original" ]; then
+            echo "scale_filter=" >> $GITHUB_OUTPUT
+            echo "Using original resolution"
+          else
+            echo "scale_filter=-vf scale=$RES" >> $GITHUB_OUTPUT
+            echo "Scaling to $RES"
+          fi
+
+      - name: Transcode
+        run: |
+          ENCODER=${{ steps.enc.outputs.encoder }}
+          EXTRA_OPTS=${{ steps.enc.outputs.extra_opts }}
+          PIX_FMT=${{ steps.enc.outputs.pix_fmt }}
+          SCALE_FILTER=${{ steps.scale.outputs.scale_filter }}
+          BITRATE=${{ github.event.inputs.bitrate }}
+          OUTPUT="output_${{ github.event.inputs.codec }}_${BITRATE}.mkv"
+
+          echo "Encoder: $ENCODER"
+          echo "Bitrate: $BITRATE"
+          echo "Pix_fmt: $PIX_FMT"
+          echo "Scale: $SCALE_FILTER"
+          echo "Output: $OUTPUT"
+
+          ffmpeg -y -i input.mp4 \
+            $SCALE_FILTER \
+            -c:v $ENCODER -b:v $BITRATE $EXTRA_OPTS \
+            -pix_fmt $PIX_FMT \
+            -c:a copy \
+            -map_metadata -1 \
+            "$OUTPUT"
+
+          ls -lh "$OUTPUT"
+          echo "=== Output video info ==="
+          ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height,r_frame_rate,duration,codec_name,bit_rate,pix_fmt \
+            -of default=noprint_wrappers=1 "$OUTPUT"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcoded-video
+          path: output_*.mkv
+          retention-days: 7
