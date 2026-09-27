@@ -1,8 +1,12 @@
-name: Remove Watermark + RIFE 20221029 (Sharded)
+name: Remove Watermark + RIFE (Configurable)
 
 on:
   workflow_dispatch:
     inputs:
+      video_url:
+        description: '输入视频 URL（直链）'
+        required: true
+        default: 'https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4'
       region:
         description: '水印区域 x,y,w,h'
         required: true
@@ -19,41 +23,98 @@ on:
         description: '原始帧率'
         required: true
         default: '30'
+      shard_mode:
+        description: '分片模式（auto=按秒数自动计算，manual=手动指定数量）'
+        required: true
+        type: choice
+        options:
+          - auto
+          - manual
+        default: 'auto'
+      shard_seconds:
+        description: '【auto 模式】每片时长（秒）'
+        required: false
+        default: '5'
+      num_shards:
+        description: '【manual 模式】分片数量（2-16）'
+        required: false
+        default: '4'
       ctx_frames:
         description: '上下文帧数（前后各多取）'
         required: true
         default: '10'
+      video_codec:
+        description: '视频编码器'
+        required: true
+        type: choice
+        options:
+          - av1
+          - hevc
+        default: 'av1'
+      crf:
+        description: 'CRF（AV1: 0-63，HEVC: 0-51；0=无损，18=视觉无损）'
+        required: true
+        default: '18'
 
 jobs:
   # ============================================
-  # Stage 1: 去水印 (4 分片并行，按帧号精确提取)
+  # Prepare: 下载视频、探测、决定分片
+  # ============================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      shard_matrix: ${{ steps.gen.outputs.matrix }}
+      num_shards: ${{ steps.gen.outputs.num_shards }}
+    steps:
+      - name: Download input video
+        run: |
+          wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
+          ls -lh input.mp4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Compute shard count
+        id: gen
+        run: |
+          MODE=${{ github.event.inputs.shard_mode }}
+
+          if [ "$MODE" = "auto" ]; then
+            DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 input.mp4)
+            SECS=${{ github.event.inputs.shard_seconds }}
+            N=$(awk -v d="$DURATION" -v s="$SECS" 'BEGIN { print int((d + s - 0.001) / s) }')
+            echo "Auto mode: duration=${DURATION}s, shard_seconds=${SECS}s -> ${N} shards"
+          else
+            N=${{ github.event.inputs.num_shards }}
+            echo "Manual mode: ${N} shards"
+          fi
+
+          if [ "$N" -lt 1 ]; then N=1; fi
+          if [ "$N" -gt 16 ]; then N=16; fi
+
+          SHARDS=$(seq -s, 0 $((N - 1)))
+          echo "num_shards=$N" >> $GITHUB_OUTPUT
+          echo "matrix={\"shard\":[$SHARDS]}" >> $GITHUB_OUTPUT
+          echo "Final matrix: {\"shard\":[$SHARDS]}"
+
+  # ============================================
+  # Stage 1: 去水印
   # ============================================
   remove_wm:
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - shard: 0
-            head_ctx: 0
-            tail_ctx: 1
-          - shard: 1
-            head_ctx: 1
-            tail_ctx: 1
-          - shard: 2
-            head_ctx: 1
-            tail_ctx: 1
-          - shard: 3
-            head_ctx: 1
-            tail_ctx: 0
+      matrix: ${{ fromJSON(needs.prepare.outputs.shard_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download input video from Release
+      - name: Download input video
         run: |
-          wget -q -O input.mp4 \
-            https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4
+          wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
           ls -lh input.mp4
 
       - uses: actions/setup-python@v5
@@ -76,32 +137,47 @@ jobs:
       - name: Compute shard frame range
         id: t
         run: |
-          CTX=${{ github.event.inputs.ctx_frames }}
           SHARD=${{ matrix.shard }}
-          HEAD=${{ matrix.head_ctx }}
-          TAIL=${{ matrix.tail_ctx }}
+          NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
+          CTX=${{ github.event.inputs.ctx_frames }}
+
+          if [ "$SHARD" -eq 0 ]; then HEAD_CTX=0; else HEAD_CTX=1; fi
+          if [ "$SHARD" -eq $((NUM_SHARDS - 1)) ]; then TAIL_CTX=0; else TAIL_CTX=1; fi
 
           TOTAL_FRAMES=$(ffprobe -v error -select_streams v:0 -count_frames \
             -show_entries stream=nb_read_frames -of csv=p=0 input.mp4)
-          echo "Total frames probed: $TOTAL_FRAMES"
+          echo "Total frames: $TOTAL_FRAMES"
 
-          FRAMES_PER_SHARD=$(( (TOTAL_FRAMES + 3) / 4 ))
-
+          FRAMES_PER_SHARD=$(( (TOTAL_FRAMES + NUM_SHARDS - 1) / NUM_SHARDS ))
           CORE_START=$(( SHARD * FRAMES_PER_SHARD ))
           CORE_END=$(( CORE_START + FRAMES_PER_SHARD - 1 ))
-          if [ $CORE_END -ge $TOTAL_FRAMES ]; then
-            CORE_END=$(( TOTAL_FRAMES - 1 ))
-          fi
+          if [ $CORE_END -ge $TOTAL_FRAMES ]; then CORE_END=$(( TOTAL_FRAMES - 1 )); fi
 
-          SEL_START=$(( CORE_START - HEAD * CTX ))
-          SEL_END=$(( CORE_END + TAIL * CTX ))
+          SEL_START=$(( CORE_START - HEAD_CTX * CTX ))
+          SEL_END=$(( CORE_END + TAIL_CTX * CTX ))
           if [ $SEL_START -lt 0 ]; then SEL_START=0; fi
 
-          echo "core_start=$CORE_START" >> $GITHUB_OUTPUT
-          echo "core_end=$CORE_END" >> $GITHUB_OUTPUT
+          echo "head_ctx=$HEAD_CTX" >> $GITHUB_OUTPUT
+          echo "tail_ctx=$TAIL_CTX" >> $GITHUB_OUTPUT
           echo "sel_start=$SEL_START" >> $GITHUB_OUTPUT
           echo "sel_end=$SEL_END" >> $GITHUB_OUTPUT
-          echo "Shard $SHARD: core=[$CORE_START,$CORE_END] sel=[$SEL_START,$SEL_END]"
+          echo "Shard $SHARD/$NUM_SHARDS: core=[$CORE_START,$CORE_END] sel=[$SEL_START,$SEL_END]"
+
+      - name: Resolve encoder settings
+        id: enc
+        run: |
+          CODEC=${{ github.event.inputs.video_codec }}
+          if [ "$CODEC" = "av1" ]; then
+            echo "encoder=libaom-av1" >> $GITHUB_OUTPUT
+            echo "pix_fmt=yuv444p10le" >> $GITHUB_OUTPUT
+            echo "extra_opts=-cpu-used 6 -row-mt 1 -threads 2" >> $GITHUB_OUTPUT
+          elif [ "$CODEC" = "hevc" ]; then
+            echo "encoder=libx265" >> $GITHUB_OUTPUT
+            echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset medium -x265-params pools=2" >> $GITHUB_OUTPUT
+          else
+            echo "Unknown codec: $CODEC"; exit 1
+          fi
 
       - name: Remove watermark (shard ${{ matrix.shard }})
         env:
@@ -113,7 +189,13 @@ jobs:
           set -o pipefail
           SEL_START=${{ steps.t.outputs.sel_start }}
           SEL_END=${{ steps.t.outputs.sel_end }}
-          echo "Processing shard ${{ matrix.shard }}: frames [$SEL_START, $SEL_END]"
+          ENCODER=${{ steps.enc.outputs.encoder }}
+          PIX_FMT=${{ steps.enc.outputs.pix_fmt }}
+          EXTRA_OPTS=${{ steps.enc.outputs.extra_opts }}
+          CRF=${{ github.event.inputs.crf }}
+
+          echo "Shard ${{ matrix.shard }}: frames [$SEL_START, $SEL_END]"
+          echo "Encoder: $ENCODER  pix_fmt: $PIX_FMT  crf: $CRF"
 
           ffmpeg -i input.mp4 \
             -vf "select='between(n,$SEL_START,$SEL_END)'" \
@@ -122,8 +204,8 @@ jobs:
             | python scripts/process.py \
             | ffmpeg -y \
                 -f rawvideo -pix_fmt bgr24 -s ${W}x${H} -r ${FPS} -i - \
-                -c:v libaom-av1 -crf 0 -cpu-used 8 -row-mt 1 -threads 2 \
-                -pix_fmt yuv444p10le \
+                -c:v $ENCODER -crf $CRF $EXTRA_OPTS \
+                -pix_fmt $PIX_FMT \
                 -an wm_shard_${{ matrix.shard }}.mkv
 
           ls -lh wm_shard_${{ matrix.shard }}.mkv
@@ -136,28 +218,15 @@ jobs:
           retention-days: 7
 
   # ============================================
-  # Stage 2: RIFE 20221029 补帧 (4 分片并行，PNG 无损)
+  # Stage 2: RIFE 补帧
   # ============================================
   interpolate:
-    needs: remove_wm
+    needs: [prepare, remove_wm]
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - shard: 0
-            head_ctx: 0
-            tail_ctx: 1
-          - shard: 1
-            head_ctx: 1
-            tail_ctx: 1
-          - shard: 2
-            head_ctx: 1
-            tail_ctx: 1
-          - shard: 3
-            head_ctx: 1
-            tail_ctx: 0
+      matrix: ${{ fromJSON(needs.prepare.outputs.shard_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -210,13 +279,41 @@ jobs:
           echo "RIFE out: $(ls frames_out | wc -l)"
           du -sh frames_out
 
-      - name: Trim context and rebuild 60fps AV1 lossless
-        env:
-          CTX_FRAMES: ${{ github.event.inputs.ctx_frames }}
+      - name: Compute context
+        id: ctx
+        run: |
+          SHARD=${{ matrix.shard }}
+          NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
+          if [ "$SHARD" -eq 0 ]; then HEAD_CTX=0; else HEAD_CTX=1; fi
+          if [ "$SHARD" -eq $((NUM_SHARDS - 1)) ]; then TAIL_CTX=0; else TAIL_CTX=1; fi
+          echo "head_ctx=$HEAD_CTX" >> $GITHUB_OUTPUT
+          echo "tail_ctx=$TAIL_CTX" >> $GITHUB_OUTPUT
+
+      - name: Resolve encoder settings
+        id: enc
+        run: |
+          CODEC=${{ github.event.inputs.video_codec }}
+          if [ "$CODEC" = "av1" ]; then
+            echo "encoder=libaom-av1" >> $GITHUB_OUTPUT
+            echo "pix_fmt=yuv444p10le" >> $GITHUB_OUTPUT
+            echo "extra_opts=-cpu-used 6 -row-mt 1 -threads 2" >> $GITHUB_OUTPUT
+          elif [ "$CODEC" = "hevc" ]; then
+            echo "encoder=libx265" >> $GITHUB_OUTPUT
+            echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
+            echo "extra_opts=-preset medium -x265-params pools=2" >> $GITHUB_OUTPUT
+          else
+            echo "Unknown codec: $CODEC"; exit 1
+          fi
+
+      - name: Trim context and rebuild 60fps
         run: |
           CTX=${{ github.event.inputs.ctx_frames }}
-          HEAD_CTX=${{ matrix.head_ctx }}
-          TAIL_CTX=${{ matrix.tail_ctx }}
+          HEAD_CTX=${{ steps.ctx.outputs.head_ctx }}
+          TAIL_CTX=${{ steps.ctx.outputs.tail_ctx }}
+          ENCODER=${{ steps.enc.outputs.encoder }}
+          PIX_FMT=${{ steps.enc.outputs.pix_fmt }}
+          EXTRA_OPTS=${{ steps.enc.outputs.extra_opts }}
+          CRF=${{ github.event.inputs.crf }}
 
           TOTAL_INTERP=$(ls frames_out/*.png | wc -l)
           HEAD_TRIM=$(( HEAD_CTX * 2 * CTX ))
@@ -226,11 +323,12 @@ jobs:
 
           echo "TOTAL=$TOTAL_INTERP HEAD_TRIM=$HEAD_TRIM TAIL_TRIM=$TAIL_TRIM"
           echo "Keep [$START, $END] = $(( END - START + 1 )) frames"
+          echo "Encoder: $ENCODER  crf: $CRF"
 
           ffmpeg -y -framerate 60 -i frames_out/%06d.png \
             -vf "select='between(n,$START,$END)',setpts=N/FRAME_RATE/TB" \
-            -c:v libaom-av1 -crf 0 -cpu-used 8 -row-mt 1 -threads 2 \
-            -pix_fmt yuv444p10le \
+            -c:v $ENCODER -crf $CRF $EXTRA_OPTS \
+            -pix_fmt $PIX_FMT \
             -an interp_shard_${{ matrix.shard }}.mkv
 
           ls -lh interp_shard_${{ matrix.shard }}.mkv
@@ -246,15 +344,14 @@ jobs:
   # Stage 3: 合并 + 音轨还原
   # ============================================
   merge:
-    needs: interpolate
+    needs: [prepare, interpolate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download input video from Release
+      - name: Download input video
         run: |
-          wget -q -O input.mp4 \
-            https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4
+          wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
 
       - name: Download all interp shards
         uses: actions/download-artifact@v4
@@ -267,8 +364,9 @@ jobs:
 
       - name: Concat + restore audio (final MKV)
         run: |
+          NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
           > list.txt
-          for i in 0 1 2 3; do
+          for i in $(seq 0 $((NUM_SHARDS - 1))); do
             echo "file 'shards/interp-shard-$i/interp_shard_$i.mkv'" >> list.txt
           done
           cat list.txt
@@ -284,7 +382,7 @@ jobs:
           ls -lh output_60fps.mkv
           echo "=== Final video info ==="
           ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height,r_frame_rate,nb_frames,duration,pix_fmt \
+            -show_entries stream=width,height,r_frame_rate,nb_frames,duration,pix_fmt,codec_name \
             -of default=noprint_wrappers=1 output_60fps.mkv
 
       - name: Upload final
