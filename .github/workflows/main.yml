@@ -39,9 +39,17 @@ on:
         description: '【manual 模式】分片数量（2-16）'
         required: false
         default: '4'
-      ctx_frames:
-        description: '上下文帧数（前后各多取）'
+      enable_interpolation:
+        description: '是否启用 RIFE 补帧（30→60fps）'
         required: true
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+        default: 'yes'
+      ctx_frames:
+        description: '【补帧时生效】上下文帧数（前后各多取）'
+        required: false
         default: '10'
       video_codec:
         description: '视频编码器'
@@ -134,15 +142,24 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install simple-lama-inpainting opencv-python-headless pillow numpy
 
+      # ⬇️ 关键：补帧时才加 context，不补帧时精确切核心帧
       - name: Compute shard frame range
         id: t
         run: |
           SHARD=${{ matrix.shard }}
           NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
-          CTX=${{ github.event.inputs.ctx_frames }}
+          ENABLE_INTERP=${{ github.event.inputs.enable_interpolation }}
 
-          if [ "$SHARD" -eq 0 ]; then HEAD_CTX=0; else HEAD_CTX=1; fi
-          if [ "$SHARD" -eq $((NUM_SHARDS - 1)) ]; then TAIL_CTX=0; else TAIL_CTX=1; fi
+          if [ "$ENABLE_INTERP" = "yes" ]; then
+            CTX=${{ github.event.inputs.ctx_frames }}
+            if [ "$SHARD" -eq 0 ]; then HEAD_CTX=0; else HEAD_CTX=1; fi
+            if [ "$SHARD" -eq $((NUM_SHARDS - 1)) ]; then TAIL_CTX=0; else TAIL_CTX=1; fi
+          else
+            CTX=0
+            HEAD_CTX=0
+            TAIL_CTX=0
+            echo "Interpolation disabled: no context frames"
+          fi
 
           TOTAL_FRAMES=$(ffprobe -v error -select_streams v:0 -count_frames \
             -show_entries stream=nb_read_frames -of csv=p=0 input.mp4)
@@ -161,7 +178,7 @@ jobs:
           echo "tail_ctx=$TAIL_CTX" >> $GITHUB_OUTPUT
           echo "sel_start=$SEL_START" >> $GITHUB_OUTPUT
           echo "sel_end=$SEL_END" >> $GITHUB_OUTPUT
-          echo "Shard $SHARD/$NUM_SHARDS: core=[$CORE_START,$CORE_END] sel=[$SEL_START,$SEL_END]"
+          echo "Shard $SHARD/$NUM_SHARDS: core=[$CORE_START,$CORE_END] sel=[$SEL_START,$SEL_END] ctx=(H=$HEAD_CTX,T=$TAIL_CTX)"
 
       - name: Resolve encoder settings
         id: enc
@@ -218,10 +235,11 @@ jobs:
           retention-days: 7
 
   # ============================================
-  # Stage 2: RIFE 补帧
+  # Stage 2: RIFE 补帧（可选）
   # ============================================
   interpolate:
     needs: [prepare, remove_wm]
+    if: github.event.inputs.enable_interpolation == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -341,10 +359,15 @@ jobs:
           retention-days: 7
 
   # ============================================
-  # Stage 3: 合并 + 音轨还原
+  # Stage 3: 合并 + 音轨还原（根据是否补帧选择源）
   # ============================================
   merge:
-    needs: [prepare, interpolate]
+    needs: [prepare, remove_wm, interpolate]
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.remove_wm.result == 'success' &&
+      (needs.interpolate.result == 'success' || needs.interpolate.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -353,7 +376,7 @@ jobs:
         run: |
           wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
 
-      - name: Download all interp shards
+      - name: Download all shards
         uses: actions/download-artifact@v4
         with:
           path: shards
@@ -365,29 +388,41 @@ jobs:
       - name: Concat + restore audio (final MKV)
         run: |
           NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
+          ENABLE_INTERP=${{ github.event.inputs.enable_interpolation }}
+
+          if [ "$ENABLE_INTERP" = "yes" ]; then
+            SHARD_PREFIX="interp-shard"
+            SHARD_FILE="interp_shard"
+            echo "Using interpolated shards (60fps)"
+          else
+            SHARD_PREFIX="wm-shard"
+            SHARD_FILE="wm_shard"
+            echo "Using watermark-removed shards (original fps)"
+          fi
+
           > list.txt
           for i in $(seq 0 $((NUM_SHARDS - 1))); do
-            echo "file 'shards/interp-shard-$i/interp_shard_$i.mkv'" >> list.txt
+            echo "file 'shards/${SHARD_PREFIX}-${i}/${SHARD_FILE}_${i}.mkv'" >> list.txt
           done
           cat list.txt
 
-          ffmpeg -y -f concat -safe 0 -i list.txt -c copy merged_60fps.mkv
+          ffmpeg -y -f concat -safe 0 -i list.txt -c copy merged.mkv
 
-          ffmpeg -y -i merged_60fps.mkv -i input.mp4 \
+          ffmpeg -y -i merged.mkv -i input.mp4 \
             -map 0:v -map 1:a? \
             -c:v copy -c:a copy \
             -map_metadata -1 \
-            output_60fps.mkv
+            output.mkv
 
-          ls -lh output_60fps.mkv
+          ls -lh output.mkv
           echo "=== Final video info ==="
           ffprobe -v error -select_streams v:0 \
             -show_entries stream=width,height,r_frame_rate,nb_frames,duration,pix_fmt,codec_name \
-            -of default=noprint_wrappers=1 output_60fps.mkv
+            -of default=noprint_wrappers=1 output.mkv
 
       - name: Upload final
         uses: actions/upload-artifact@v4
         with:
-          name: output-video-60fps
-          path: output_60fps.mkv
+          name: output-video
+          path: output.mkv
           retention-days: 7
