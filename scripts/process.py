@@ -1,10 +1,10 @@
+
 import sys
 import os
 import cv2
 import numpy as np
 from PIL import Image
-from iopaint.model_manager import ModelManager
-from iopaint.schema import InpaintRequest, HDStrategy
+from simple_lama_inpainting import SimpleLama
 
 # ---- 参数 ----
 x, y, w, h = map(int, os.environ['REGION'].split(','))
@@ -29,13 +29,8 @@ print(f"[info] Crop ({x1},{y1})->({x2},{y2}), mask=({mx1},{my1})->({mx2},{my2})"
 
 # ---- 初始化 LaMa ----
 print("[info] Loading LaMa model...", file=sys.stderr)
-model = ModelManager(name="lama", device="cpu")
-config = InpaintRequest(
-    hd_strategy=HDStrategy.ORIGINAL,
-    hd_strategy_crop_margin=64,
-    hd_strategy_crop_trigger_size=1024,
-    hd_strategy_resize_limit=2048,
-)
+simple_lama = SimpleLama()
+print("[info] LaMa model loaded.", file=sys.stderr)
 
 # ---- 预构造 mask（每帧复用）----
 mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
@@ -68,7 +63,8 @@ while True:
     crop = frame[y1:y2, x1:x2].copy()
     crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
 
-    result_pil = model(crop_pil, mask_pil, config)
+    # simple_lama 输入输出都是 PIL Image
+    result_pil = simple_lama(crop_pil, mask_pil)
     result = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
 
     frame[y1:y2, x1:x2] = result
