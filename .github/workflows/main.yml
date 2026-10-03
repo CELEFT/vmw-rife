@@ -104,14 +104,18 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Clone ProPainter
+        run: git clone https://github.com/sczhou/ProPainter.git
+
       - name: Install ffmpeg & Python deps
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install opencv-python-headless numpy
-
-      - name: Clone ProPainter
-        run: git clone https://github.com/sczhou/ProPainter.git
+          if [ -f ProPainter/requirements.txt ]; then
+            grep -v -E '^torch|^torchvision' ProPainter/requirements.txt > /tmp/req.txt
+            pip install -r /tmp/req.txt
+          fi
+          pip install imageio imageio-ffmpeg tqdm scipy av opencv-python-headless numpy
 
       - name: Cache ProPainter Models
         uses: actions/cache@v4
@@ -207,8 +211,6 @@ jobs:
 
       - name: Interpolate to 60fps using minterpolate
         run: |
-          # 使用 FFmpeg 的 minterpolate 滤镜进行补帧，速度快但质量一般
-          # 若需更高质量的 RIFE 补帧，可自行替换命令
           ffmpeg -y -i output.mp4 \
             -vf "minterpolate='fps=60'" \
             -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
