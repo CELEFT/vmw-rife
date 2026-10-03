@@ -45,14 +45,12 @@ def main():
     min_count = valid_count * args.min_count_ratio
     stable_mask = np.where(accumulate >= min_count, 255, 0).astype(np.uint8)
 
-    # 检查自动检测结果是否有效
     white_pixels = np.sum(stable_mask == 255)
     total_pixels = w * h
     white_ratio = white_pixels / total_pixels
 
     print(f"Auto-detected white pixel ratio: {white_ratio:.2%}")
 
-    # 兜底逻辑：检测失败则使用全 ROI 矩形
     if white_ratio < 0.01 or white_ratio > 0.9:
         print("⚠️ Auto-detection failed or abnormal. Applying full ROI rectangle as fallback mask.")
         stable_mask = np.ones((h, w), dtype=np.uint8) * 255
