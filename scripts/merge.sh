@@ -7,9 +7,7 @@ CRF_OVERRIDE=${2:-}   # 可选：手动指定 CRF，留空则用编码器默认�
 IFS=',' read X Y W H <<< "$REGION"
 echo "Overlay ROI back to original video at x=$X, y=$Y"
 
-# ============================================
 # 1. 检测原视频编码器
-# ============================================
 ORIG_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 input.mp4)
 echo "Original video codec: $ORIG_CODEC"
 
@@ -55,9 +53,7 @@ fi
 
 echo "Using encoder=$ENCODER, crf=$CRF, pix_fmt=$PIX_FMT, opts=$EXTRA_OPTS"
 
-# ============================================
 # 2. 拼接所有修复好的 ROI 分片
-# ============================================
 > list.txt
 for part_file in parts/part-*/part_*.mp4; do
   if [ -f "$part_file" ]; then
@@ -68,9 +64,7 @@ cat list.txt
 
 ffmpeg -y -f concat -safe 0 -i list.txt -c copy fixed_roi.mp4
 
-# ============================================
 # 3. 贴回原视频（使用原编码器重新编码）
-# ============================================
 ffmpeg -y \
   -i input.mp4 \
   -i fixed_roi.mp4 \
@@ -79,9 +73,7 @@ ffmpeg -y \
   -pix_fmt $PIX_FMT \
   -an final_video.mp4
 
-# ============================================
 # 4. 合并原音频
-# ============================================
 if ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 input.mp4 | grep -q audio; then
   echo "Audio detected, merging..."
   ffmpeg -y -i final_video.mp4 -i input.mp4 \
