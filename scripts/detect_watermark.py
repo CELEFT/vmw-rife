@@ -52,17 +52,14 @@ def main():
 
     print(f"Auto-detected white pixel ratio: {white_ratio:.2%}")
 
-    # 兜底逻辑：如果自动检测几乎全黑（小于1%）或几乎全白（大于90%），说明检测失败
+    # 兜底逻辑：检测失败则使用全 ROI 矩形
     if white_ratio < 0.01 or white_ratio > 0.9:
         print("⚠️ Auto-detection failed or abnormal. Applying full ROI rectangle as fallback mask.")
-        # 将整个 ROI 区域设为白色
         stable_mask = np.ones((h, w), dtype=np.uint8) * 255
     else:
-        # 只有在检测有效时，才进行膨胀
         kernel = np.ones((5, 5), np.uint8)
         stable_mask = cv2.dilate(stable_mask, kernel, iterations=1)
 
-    # 生成逐帧Mask视频
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(args.output, fourcc, args.fps, (w, h), isColor=False)
 
