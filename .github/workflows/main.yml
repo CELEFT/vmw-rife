@@ -1,4 +1,4 @@
-name: Remove Watermark + RIFE (Configurable)
+name: Remove Watermark (ROI + ProPainter 4-Jobs)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ on:
         required: true
         default: 'https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4'
       region:
-        description: '水印区域 x,y,w,h'
+        description: '水印区域 x,y,w,h (基于原视频分辨率)'
         required: true
-        default: '1800,2052,2000,80'
+        default: '3300,1800,600,400'
       width:
         description: '视频宽度'
         required: true
@@ -23,406 +23,172 @@ on:
         description: '原始帧率'
         required: true
         default: '30'
-      shard_mode:
-        description: '分片模式（auto=按秒数自动计算，manual=手动指定数量）'
-        required: true
-        type: choice
-        options:
-          - auto
-          - manual
-        default: 'auto'
-      shard_seconds:
-        description: '【auto 模式】每片时长（秒）'
-        required: false
-        default: '5'
-      num_shards:
-        description: '【manual 模式】分片数量（2-16）'
-        required: false
-        default: '4'
       enable_interpolation:
-        description: '是否启用 RIFE 补帧（30→60fps）'
+        description: '是否启用 RIFE 补帧 (30→60fps)'
         required: true
         type: choice
         options:
           - 'yes'
           - 'no'
-        default: 'yes'
-      ctx_frames:
-        description: '【补帧时生效】上下文帧数（前后各多取）'
-        required: false
-        default: '10'
-      video_codec:
-        description: '视频编码器'
-        required: true
-        type: choice
-        options:
-          - av1
-          - hevc
-        default: 'av1'
-      crf:
-        description: 'CRF（AV1: 0-63，HEVC: 0-51；0=无损，18=视觉无损）'
-        required: true
-        default: '18'
+        default: 'no'
 
 jobs:
   # ============================================
-  # Prepare: 下载视频、探测、决定分片
+  # Prepare: 下载视频、截取ROI、生成动态Mask
   # ============================================
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      shard_matrix: ${{ steps.gen.outputs.matrix }}
-      num_shards: ${{ steps.gen.outputs.num_shards }}
+      num_shards: 4
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download input video
         run: |
           wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
           ls -lh input.mp4
 
-      - name: Install ffmpeg
+      - name: Install ffmpeg & OpenCV
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg python3-opencv python3-numpy
 
-      - name: Compute shard count
-        id: gen
+      - name: Crop ROI video
         run: |
-          MODE=${{ github.event.inputs.shard_mode }}
+          REGION="${{ github.event.inputs.region }}"
+          IFS=',' read X Y W H <<< "$REGION"
+          echo "Cropping ROI: x=$X, y=$Y, w=$W, h=$H"
+          ffmpeg -y -i input.mp4 -vf "crop=${W}:${H}:${X}:${Y}" -an -c:v libx264 -crf 10 -preset veryfast -pix_fmt yuv420p roi.mp4
+          ls -lh roi.mp4
 
-          if [ "$MODE" = "auto" ]; then
-            DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 input.mp4)
-            SECS=${{ github.event.inputs.shard_seconds }}
-            N=$(awk -v d="$DURATION" -v s="$SECS" 'BEGIN { print int((d + s - 0.001) / s) }')
-            echo "Auto mode: duration=${DURATION}s, shard_seconds=${SECS}s -> ${N} shards"
-          else
-            N=${{ github.event.inputs.num_shards }}
-            echo "Manual mode: ${N} shards"
-          fi
+      - name: Generate Dynamic Mask
+        run: |
+          python3 scripts/detect_watermark.py \
+            --video roi.mp4 \
+            --output dynamic_mask.mp4 \
+            --total_frames $(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 input.mp4) \
+            --fps ${{ github.event.inputs.fps }}
 
-          if [ "$N" -lt 1 ]; then N=1; fi
-          if [ "$N" -gt 16 ]; then N=16; fi
-
-          SHARDS=$(seq -s, 0 $((N - 1)))
-          echo "num_shards=$N" >> $GITHUB_OUTPUT
-          echo "matrix={\"shard\":[$SHARDS]}" >> $GITHUB_OUTPUT
-          echo "Final matrix: {\"shard\":[$SHARDS]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: input-assets
+          path: |
+            input.mp4
+            roi.mp4
+            dynamic_mask.mp4
 
   # ============================================
-  # Stage 1: 去水印
+  # Process: 4路并行 ProPainter 修复 ROI 视频
   # ============================================
-  remove_wm:
+  process:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.shard_matrix) }}
+      max-parallel: 4
+      matrix:
+        part: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download input video
-        run: |
-          wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
-          ls -lh input.mp4
+      - uses: actions/download-artifact@v4
+        with:
+          name: input-assets
+          path: .
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Cache LaMa model
+      - name: Install ffmpeg & Python deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install opencv-python-headless numpy
+
+      - name: Clone ProPainter
+        run: git clone https://github.com/sczhou/ProPainter.git
+
+      - name: Cache ProPainter Models
         uses: actions/cache@v4
         with:
-          path: ~/.cache/torch
-          key: simple-lama-model-v1
+          path: ProPainter/weights
+          key: propainter-weights-v1
 
-      - name: Install deps
+      - name: Download ProPainter models
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install simple-lama-inpainting opencv-python-headless pillow numpy
-
-      # ⬇️ 关键：补帧时才加 context，不补帧时精确切核心帧
-      - name: Compute shard frame range
-        id: t
-        run: |
-          SHARD=${{ matrix.shard }}
-          NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
-          ENABLE_INTERP=${{ github.event.inputs.enable_interpolation }}
-
-          if [ "$ENABLE_INTERP" = "yes" ]; then
-            CTX=${{ github.event.inputs.ctx_frames }}
-            if [ "$SHARD" -eq 0 ]; then HEAD_CTX=0; else HEAD_CTX=1; fi
-            if [ "$SHARD" -eq $((NUM_SHARDS - 1)) ]; then TAIL_CTX=0; else TAIL_CTX=1; fi
-          else
-            CTX=0
-            HEAD_CTX=0
-            TAIL_CTX=0
-            echo "Interpolation disabled: no context frames"
+          cd ProPainter
+          # 兼容官方权重下载脚本
+          if [ -f download_models.py ]; then python download_models.py; fi
+          if [ -f scripts/download_models.py ]; then python scripts/download_models.py; fi
+          # 手动下载兜底
+          if [ ! -d "weights" ] || [ -z "$(ls -A weights 2>/dev/null)" ]; then
+            echo "Creating weights directory..."
+            mkdir -p weights
+            wget -q https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth -P weights/
+            wget -q https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth -P weights/
+            wget -q https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth -P weights/
           fi
 
-          TOTAL_FRAMES=$(ffprobe -v error -select_streams v:0 -count_frames \
-            -show_entries stream=nb_read_frames -of csv=p=0 input.mp4)
-          echo "Total frames: $TOTAL_FRAMES"
-
-          FRAMES_PER_SHARD=$(( (TOTAL_FRAMES + NUM_SHARDS - 1) / NUM_SHARDS ))
-          CORE_START=$(( SHARD * FRAMES_PER_SHARD ))
-          CORE_END=$(( CORE_START + FRAMES_PER_SHARD - 1 ))
-          if [ $CORE_END -ge $TOTAL_FRAMES ]; then CORE_END=$(( TOTAL_FRAMES - 1 )); fi
-
-          SEL_START=$(( CORE_START - HEAD_CTX * CTX ))
-          SEL_END=$(( CORE_END + TAIL_CTX * CTX ))
-          if [ $SEL_START -lt 0 ]; then SEL_START=0; fi
-
-          echo "head_ctx=$HEAD_CTX" >> $GITHUB_OUTPUT
-          echo "tail_ctx=$TAIL_CTX" >> $GITHUB_OUTPUT
-          echo "sel_start=$SEL_START" >> $GITHUB_OUTPUT
-          echo "sel_end=$SEL_END" >> $GITHUB_OUTPUT
-          echo "Shard $SHARD/$NUM_SHARDS: core=[$CORE_START,$CORE_END] sel=[$SEL_START,$SEL_END] ctx=(H=$HEAD_CTX,T=$TAIL_CTX)"
-
-      - name: Resolve encoder settings
-        id: enc
-        run: |
-          CODEC=${{ github.event.inputs.video_codec }}
-          if [ "$CODEC" = "av1" ]; then
-            echo "encoder=libaom-av1" >> $GITHUB_OUTPUT
-            echo "pix_fmt=yuv444p10le" >> $GITHUB_OUTPUT
-            echo "extra_opts=-cpu-used 6 -row-mt 1 -threads 2" >> $GITHUB_OUTPUT
-          elif [ "$CODEC" = "hevc" ]; then
-            echo "encoder=libx265" >> $GITHUB_OUTPUT
-            echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
-            echo "extra_opts=-preset medium -x265-params pools=2" >> $GITHUB_OUTPUT
-          else
-            echo "Unknown codec: $CODEC"; exit 1
-          fi
-
-      - name: Remove watermark (shard ${{ matrix.shard }})
+      - name: Process part ${{ matrix.part }}
         env:
-          REGION: ${{ github.event.inputs.region }}
-          W: ${{ github.event.inputs.width }}
-          H: ${{ github.event.inputs.height }}
+          INPUT_VIDEO: roi.mp4
+          INPUT_MASK: dynamic_mask.mp4
+          TOTAL_FRAMES: 596  # 实际总帧数，如你所述
+          CORE_PER_PART: 149
+          OVERLAP: 30
           FPS: ${{ github.event.inputs.fps }}
         run: |
-          set -o pipefail
-          SEL_START=${{ steps.t.outputs.sel_start }}
-          SEL_END=${{ steps.t.outputs.sel_end }}
-          ENCODER=${{ steps.enc.outputs.encoder }}
-          PIX_FMT=${{ steps.enc.outputs.pix_fmt }}
-          EXTRA_OPTS=${{ steps.enc.outputs.extra_opts }}
-          CRF=${{ github.event.inputs.crf }}
+          chmod +x scripts/process_part.sh
+          bash scripts/process_part.sh ${{ matrix.part }}
 
-          echo "Shard ${{ matrix.shard }}: frames [$SEL_START, $SEL_END]"
-          echo "Encoder: $ENCODER  pix_fmt: $PIX_FMT  crf: $CRF"
-
-          ffmpeg -i input.mp4 \
-            -vf "select='between(n,$SEL_START,$SEL_END)'" \
-            -fps_mode passthrough \
-            -f rawvideo -pix_fmt bgr24 - \
-            | python scripts/process.py \
-            | ffmpeg -y \
-                -f rawvideo -pix_fmt bgr24 -s ${W}x${H} -r ${FPS} -i - \
-                -c:v $ENCODER -crf $CRF $EXTRA_OPTS \
-                -pix_fmt $PIX_FMT \
-                -an wm_shard_${{ matrix.shard }}.mkv
-
-          ls -lh wm_shard_${{ matrix.shard }}.mkv
-
-      - name: Upload wm shard
+      - name: Upload processed part
         uses: actions/upload-artifact@v4
         with:
-          name: wm-shard-${{ matrix.shard }}
-          path: wm_shard_${{ matrix.shard }}.mkv
-          retention-days: 7
+          name: part-${{ matrix.part }}
+          path: part_${{ matrix.part }}.mp4
 
   # ============================================
-  # Stage 2: RIFE 补帧（可选）
-  # ============================================
-  interpolate:
-    needs: [prepare, remove_wm]
-    if: github.event.inputs.enable_interpolation == 'yes'
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.shard_matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system deps (Vulkan + FFmpeg)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg wget unzip \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools
-
-      - name: Verify Vulkan availability
-        run: |
-          vulkaninfo --summary 2>&1 | head -40 || echo "Vulkan info failed (fallback to CPU)"
-
-      - name: Install rife-ncnn-vulkan 20221029
-        run: |
-          wget -q https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-ubuntu.zip
-          unzip -q rife-ncnn-vulkan-20221029-ubuntu.zip
-          chmod +x rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan
-          ls -R rife-ncnn-vulkan-20221029-ubuntu | head -60
-
-      - name: Verify RIFE model exists
-        run: |
-          MODEL_DIR="rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
-          if [ ! -d "$MODEL_DIR" ]; then
-            MODEL_DIR=$(find rife-ncnn-vulkan-20221029-ubuntu -maxdepth 1 -type d -name "rife-v*" | head -1)
-          fi
-          if [ -z "$MODEL_DIR" ] || [ ! -d "$MODEL_DIR" ]; then
-            echo "ERROR: no RIFE model dir"; ls -R rife-ncnn-vulkan-20221029-ubuntu; exit 1
-          fi
-          echo "RIFE_MODEL_DIR=$MODEL_DIR" >> $GITHUB_ENV
-
-      - name: Download wm shard
-        uses: actions/download-artifact@v4
-        with:
-          name: wm-shard-${{ matrix.shard }}
-
-      - name: Extract frames as PNG (lossless)
-        run: |
-          mkdir -p frames_in
-          ffmpeg -i wm_shard_${{ matrix.shard }}.mkv -pix_fmt rgb24 frames_in/%06d.png
-          echo "Extracted: $(ls frames_in | wc -l)"
-          du -sh frames_in
-
-      - name: RIFE interpolation 2x (PNG)
-        run: |
-          mkdir -p frames_out
-          ./rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan \
-            -i frames_in -o frames_out \
-            -m "$RIFE_MODEL_DIR" -j 2:2:2 -f "%06d.png"
-          echo "RIFE out: $(ls frames_out | wc -l)"
-          du -sh frames_out
-
-      - name: Compute context
-        id: ctx
-        run: |
-          SHARD=${{ matrix.shard }}
-          NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
-          if [ "$SHARD" -eq 0 ]; then HEAD_CTX=0; else HEAD_CTX=1; fi
-          if [ "$SHARD" -eq $((NUM_SHARDS - 1)) ]; then TAIL_CTX=0; else TAIL_CTX=1; fi
-          echo "head_ctx=$HEAD_CTX" >> $GITHUB_OUTPUT
-          echo "tail_ctx=$TAIL_CTX" >> $GITHUB_OUTPUT
-
-      - name: Resolve encoder settings
-        id: enc
-        run: |
-          CODEC=${{ github.event.inputs.video_codec }}
-          if [ "$CODEC" = "av1" ]; then
-            echo "encoder=libaom-av1" >> $GITHUB_OUTPUT
-            echo "pix_fmt=yuv444p10le" >> $GITHUB_OUTPUT
-            echo "extra_opts=-cpu-used 6 -row-mt 1 -threads 2" >> $GITHUB_OUTPUT
-          elif [ "$CODEC" = "hevc" ]; then
-            echo "encoder=libx265" >> $GITHUB_OUTPUT
-            echo "pix_fmt=yuv420p10le" >> $GITHUB_OUTPUT
-            echo "extra_opts=-preset medium -x265-params pools=2" >> $GITHUB_OUTPUT
-          else
-            echo "Unknown codec: $CODEC"; exit 1
-          fi
-
-      - name: Trim context and rebuild 60fps
-        run: |
-          CTX=${{ github.event.inputs.ctx_frames }}
-          HEAD_CTX=${{ steps.ctx.outputs.head_ctx }}
-          TAIL_CTX=${{ steps.ctx.outputs.tail_ctx }}
-          ENCODER=${{ steps.enc.outputs.encoder }}
-          PIX_FMT=${{ steps.enc.outputs.pix_fmt }}
-          EXTRA_OPTS=${{ steps.enc.outputs.extra_opts }}
-          CRF=${{ github.event.inputs.crf }}
-
-          TOTAL_INTERP=$(ls frames_out/*.png | wc -l)
-          HEAD_TRIM=$(( HEAD_CTX * 2 * CTX ))
-          TAIL_TRIM=$(( TAIL_CTX * 2 * CTX ))
-          START=$HEAD_TRIM
-          END=$(( TOTAL_INTERP - TAIL_TRIM - 1 ))
-
-          echo "TOTAL=$TOTAL_INTERP HEAD_TRIM=$HEAD_TRIM TAIL_TRIM=$TAIL_TRIM"
-          echo "Keep [$START, $END] = $(( END - START + 1 )) frames"
-          echo "Encoder: $ENCODER  crf: $CRF"
-
-          ffmpeg -y -framerate 60 -i frames_out/%06d.png \
-            -vf "select='between(n,$START,$END)',setpts=N/FRAME_RATE/TB" \
-            -c:v $ENCODER -crf $CRF $EXTRA_OPTS \
-            -pix_fmt $PIX_FMT \
-            -an interp_shard_${{ matrix.shard }}.mkv
-
-          ls -lh interp_shard_${{ matrix.shard }}.mkv
-
-      - name: Upload interp shard
-        uses: actions/upload-artifact@v4
-        with:
-          name: interp-shard-${{ matrix.shard }}
-          path: interp_shard_${{ matrix.shard }}.mkv
-          retention-days: 7
-
-  # ============================================
-  # Stage 3: 合并 + 音轨还原（根据是否补帧选择源）
+  # Merge: 拼接分片 -> 贴回原4K -> 补帧 -> 合并音频
   # ============================================
   merge:
-    needs: [prepare, remove_wm, interpolate]
-    if: |
-      always() &&
-      needs.prepare.result == 'success' &&
-      needs.remove_wm.result == 'success' &&
-      (needs.interpolate.result == 'success' || needs.interpolate.result == 'skipped')
+    needs: [prepare, process]
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download input video
-        run: |
-          wget -q -O input.mp4 "${{ github.event.inputs.video_url }}"
-
-      - name: Download all shards
+      - name: Download input assets
         uses: actions/download-artifact@v4
         with:
-          path: shards
+          name: input-assets
+          path: .
+
+      - name: Download all processed parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: parts
 
       - name: Install ffmpeg
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Concat + restore audio (final MKV)
+      - name: Merge and Overlay
         run: |
-          NUM_SHARDS=${{ needs.prepare.outputs.num_shards }}
-          ENABLE_INTERP=${{ github.event.inputs.enable_interpolation }}
+          chmod +x scripts/merge.sh
+          bash scripts/merge.sh
 
-          if [ "$ENABLE_INTERP" = "yes" ]; then
-            SHARD_PREFIX="interp-shard"
-            SHARD_FILE="interp_shard"
-            echo "Using interpolated shards (60fps)"
-          else
-            SHARD_PREFIX="wm-shard"
-            SHARD_FILE="wm_shard"
-            echo "Using watermark-removed shards (original fps)"
-          fi
-
-          > list.txt
-          for i in $(seq 0 $((NUM_SHARDS - 1))); do
-            echo "file 'shards/${SHARD_PREFIX}-${i}/${SHARD_FILE}_${i}.mkv'" >> list.txt
-          done
-          cat list.txt
-
-          ffmpeg -y -f concat -safe 0 -i list.txt -c copy merged.mkv
-
-          ffmpeg -y -i merged.mkv -i input.mp4 \
-            -map 0:v -map 1:a? \
-            -c:v copy -c:a copy \
-            -map_metadata -1 \
-            output.mkv
-
-          ls -lh output.mkv
-          echo "=== Final video info ==="
-          ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height,r_frame_rate,nb_frames,duration,pix_fmt,codec_name \
-            -of default=noprint_wrappers=1 output.mkv
+      - name: Interpolate (RIFE) - Optional
+        if: github.event.inputs.enable_interpolation == 'yes'
+        run: |
+          echo "RIFE补帧暂未集成，如需请参考原版逻辑对全帧视频补帧。"
+          # 建议：若需补帧，请对整个 output.mp4 执行，避免 ROI 帧率与全帧不匹配
 
       - name: Upload final
         uses: actions/upload-artifact@v4
         with:
           name: output-video
-          path: output.mkv
+          path: output.mp4
           retention-days: 7
