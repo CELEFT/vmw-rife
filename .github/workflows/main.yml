@@ -110,12 +110,15 @@ jobs:
       - name: Install ffmpeg & Python deps
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          # 锁定 torch 和 torchvision 以保留 read_video API
+          pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
+          # 过滤 ProPainter 自带的 torch 依赖，避免覆盖
           if [ -f ProPainter/requirements.txt ]; then
             grep -v -E '^torch|^torchvision' ProPainter/requirements.txt > /tmp/req.txt
             pip install -r /tmp/req.txt
           fi
-          pip install imageio imageio-ffmpeg tqdm scipy av opencv-python-headless numpy
+          # 锁定 numpy<2.0，防止 opencv 崩溃
+          pip install "numpy<2.0" imageio imageio-ffmpeg tqdm scipy av opencv-python-headless
 
       - name: Cache ProPainter Models
         uses: actions/cache@v4
