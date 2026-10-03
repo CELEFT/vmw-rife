@@ -8,9 +8,9 @@ on:
         required: true
         default: 'https://github.com/CELEFT/vmw-rife/releases/download/video/input.mp4'
       region:
-        description: '水印区域 x,y,w,h (基于原视频分辨率，建议外扩100像素)'
+        description: '水印区域 x,y,w,h (建议宽度为16的倍数，如608)'
         required: true
-        default: '3300,1800,600,400'
+        default: '3300,1800,608,400'
       width:
         description: '视频宽度'
         required: true
@@ -37,9 +37,6 @@ on:
         default: 'no'
 
 jobs:
-  # ============================================
-  # Prepare: 下载视频、截取ROI、生成动态Mask
-  # ============================================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -80,9 +77,6 @@ jobs:
             roi.mp4
             dynamic_mask.mp4
 
-  # ============================================
-  # Process: 4路并行 ProPainter 修复 ROI 视频
-  # ============================================
   process:
     needs: prepare
     runs-on: ubuntu-latest
@@ -110,14 +104,11 @@ jobs:
       - name: Install ffmpeg & Python deps
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
-          # 锁定 torch 和 torchvision 以保留 read_video API
           pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
-          # 过滤 ProPainter 自带的 torch 依赖，避免覆盖
           if [ -f ProPainter/requirements.txt ]; then
             grep -v -E '^torch|^torchvision' ProPainter/requirements.txt > /tmp/req.txt
             pip install -r /tmp/req.txt
           fi
-          # 锁定 numpy<2.0，防止 opencv 崩溃
           pip install "numpy<2.0" imageio imageio-ffmpeg tqdm scipy av opencv-python-headless
 
       - name: Cache ProPainter Models
@@ -153,9 +144,6 @@ jobs:
           name: part-${{ matrix.part }}
           path: part_${{ matrix.part }}.mp4
 
-  # ============================================
-  # Merge: 拼接分片 -> 贴回原4K -> 合并音频
-  # ============================================
   merge:
     needs: [prepare, process]
     runs-on: ubuntu-latest
@@ -193,9 +181,6 @@ jobs:
           path: output.mp4
           retention-days: 7
 
-  # ============================================
-  # Interpolate: 可选补帧 (默认关闭，必须等 merge 完成)
-  # ============================================
   interpolate:
     needs: merge
     if: github.event.inputs.enable_interpolation == 'yes'
