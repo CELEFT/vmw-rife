@@ -28,25 +28,36 @@ echo "Part $PART: Core [$CORE_START,$CORE_END], Process [$PROC_START,$PROC_END],
 mkdir -p work/$PART
 cd work/$PART
 
+# ============================================
+# 1. 切出视频片段（视频保持 mp4 格式）
+# ============================================
 ffmpeg -y -i ../../$INPUT_VIDEO \
   -vf "trim=start_frame=$PROC_START:end_frame=$((PROC_END+1)),setpts=PTS-STARTPTS" \
-  -an -c:v libx264 -crf 10 -preset veryfast -pix_fmt yuv420p seg.mp4
+  -an -vsync 0 -c:v libx264 -crf 10 -preset veryfast -pix_fmt yuv420p seg.mp4
 
+# ============================================
+# 2. 切出 Mask 片段（关键修复：输出为帧序列目录）
+# ============================================
+mkdir -p seg_mask_frames
 ffmpeg -y -i ../../$INPUT_MASK \
   -vf "trim=start_frame=$PROC_START:end_frame=$((PROC_END+1)),setpts=PTS-STARTPTS" \
-  -an -c:v libx264 -crf 10 -preset veryfast -pix_fmt gray seg_mask.mp4
+  -an -vsync 0 -pix_fmt gray seg_mask_frames/%06d.png
 
-# 获取绝对路径，避免 ProPainter 内部路径寻址失败
+MASK_COUNT=$(ls seg_mask_frames/*.png 2>/dev/null | wc -l)
+echo "Mask frames generated: $MASK_COUNT"
+
 SEG_VIDEO="$(pwd)/seg.mp4"
-SEG_MASK="$(pwd)/seg_mask.mp4"
+SEG_MASK_DIR="$(pwd)/seg_mask_frames"
 OUT_DIR="$(pwd)/out"
 mkdir -p "$OUT_DIR"
 
-# 切换到 ProPainter 目录下运行
+# ============================================
+# 3. 切换到 ProPainter 目录运行（--mask 指向帧序列目录）
+# ============================================
 cd ../../ProPainter
 python inference_propainter.py \
   --video "$SEG_VIDEO" \
-  --mask "$SEG_MASK" \
+  --mask "$SEG_MASK_DIR" \
   --output "$OUT_DIR" \
   --subvideo_length 20 \
   --neighbor_length 5 \
@@ -58,6 +69,9 @@ INPAINT_VIDEO=$(find out -name "*inpaint*.mp4" | head -n 1 || true)
 if [ -z "$INPAINT_VIDEO" ]; then INPAINT_VIDEO=$(find out -name "*.mp4" | head -n 1 || true); fi
 if [ -z "$INPAINT_VIDEO" ]; then echo "ProPainter output not found"; exit 1; fi
 
+# ============================================
+# 4. 裁剪核心区间（去掉重叠的 30 帧）
+# ============================================
 ffmpeg -y -i "$INPAINT_VIDEO" \
   -vf "select='between(n,$OFFSET,$((OFFSET+CORE_PER_PART-1)))',setpts=N/FRAME_RATE/TB" \
   -vsync 0 -an -r $FPS \
