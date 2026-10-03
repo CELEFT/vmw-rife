@@ -24,9 +24,9 @@ on:
         required: true
         default: '30'
       crf:
-        description: 'CRF（18=视觉无损，0=无损）'
-        required: true
-        default: '18'
+        description: 'CRF（留空=按原编码器默认值，18=视觉无损）'
+        required: false
+        default: ''
       enable_interpolation:
         description: '是否在去水印完成后补帧到60fps（可选，默认关闭）'
         required: true
@@ -159,7 +159,7 @@ jobs:
   merge:
     needs: [prepare, process]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
